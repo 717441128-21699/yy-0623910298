@@ -147,6 +147,78 @@ function parseFile(filePath) {
   return comments;
 }
 
+function parseFiles(filePaths) {
+  const fileStats = [];
+  const allComments = [];
+  for (const fp of filePaths) {
+    const resolved = path.resolve(fp.trim());
+    const comments = parseFile(resolved);
+    const baseName = path.basename(resolved);
+    fileStats.push({ path: resolved, name: baseName, count: comments.length });
+    for (const c of comments) {
+      allComments.push({ ...c, source: baseName });
+    }
+  }
+  return { comments: allComments, fileStats };
+}
+
+function normalizeDateEnd(dateStr) {
+  const s = dateStr.trim();
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(s)) {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d, 23, 59, 59, 999);
+  }
+  if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)) {
+    const [y, m, d] = s.split('/').map(Number);
+    return new Date(y, m - 1, d, 23, 59, 59, 999);
+  }
+  return new Date(s);
+}
+
+function normalizeDateStart(dateStr) {
+  const s = dateStr.trim();
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(s)) {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d, 0, 0, 0, 0);
+  }
+  if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(s)) {
+    const [y, m, d] = s.split('/').map(Number);
+    return new Date(y, m - 1, d, 0, 0, 0, 0);
+  }
+  return new Date(s);
+}
+
+function parseCommentTime(timeStr) {
+  if (!timeStr) return NaN;
+  const s = timeStr.trim();
+  const dashMatch = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (dashMatch) {
+    const [, y, m, d, hh = 0, mm = 0, ss = 0] = dashMatch;
+    return new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss)).getTime();
+  }
+  const slashMatch = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (slashMatch) {
+    const [, y, m, d, hh = 0, mm = 0, ss = 0] = slashMatch;
+    return new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss)).getTime();
+  }
+  const t = new Date(s);
+  return isNaN(t.getTime()) ? NaN : t.getTime();
+}
+
+function filterByTimeRange(comments, timeRange) {
+  if (!timeRange || timeRange.trim() === '') return comments;
+  const parts = timeRange.split('~').map(s => s.trim());
+  if (parts.length !== 2) return comments;
+  const startMs = normalizeDateStart(parts[0]).getTime();
+  const endMs = normalizeDateEnd(parts[1]).getTime();
+  if (isNaN(startMs) || isNaN(endMs)) return comments;
+  return comments.filter(c => {
+    if (!c.time) return true;
+    const t = parseCommentTime(c.time);
+    return !isNaN(t) && t >= startMs && t <= endMs;
+  });
+}
+
 function classifyEmotion(text) {
   const scores = {};
   for (const [key, cat] of Object.entries(EMOTION_CATEGORIES)) {
@@ -193,10 +265,21 @@ function analyzeEmotions(comments) {
   return { counts, percentages, total, taggedComments };
 }
 
-function extractTopics(comments) {
+function extractTopics(comments, supplementaryFacts) {
+  const facts = supplementaryFacts || [];
   const topicHits = {};
   for (const tp of TOPIC_PATTERNS) {
-    topicHits[tp.id] = { ...tp, hits: [], score: 0 };
+    topicHits[tp.id] = { ...tp, hits: [], score: 0, addressed: false, matchingFacts: [] };
+  }
+  for (const f of facts) {
+    for (const tp of TOPIC_PATTERNS) {
+      if (tp.pattern.test(f)) {
+        topicHits[tp.id].addressed = true;
+        if (!topicHits[tp.id].matchingFacts.includes(f)) {
+          topicHits[tp.id].matchingFacts.push(f);
+        }
+      }
+    }
   }
   for (const c of comments) {
     for (const tp of TOPIC_PATTERNS) {
@@ -211,24 +294,18 @@ function extractTopics(comments) {
       }
     }
   }
+  for (const id of Object.keys(topicHits)) {
+    if (topicHits[id].addressed) {
+      topicHits[id].score = Math.max(0, topicHits[id].score * 0.25);
+    }
+  }
   const activeTopics = Object.values(topicHits)
     .filter(t => t.hits.length > 0)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => {
+      if (a.addressed !== b.addressed) return a.addressed ? 1 : -1;
+      return b.score - a.score;
+    });
   return activeTopics;
-}
-
-function filterByTimeRange(comments, timeRange) {
-  if (!timeRange || timeRange.trim() === '') return comments;
-  const parts = timeRange.split('~').map(s => s.trim());
-  if (parts.length !== 2) return comments;
-  const start = new Date(parts[0]);
-  const end = new Date(parts[1]);
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) return comments;
-  return comments.filter(c => {
-    if (!c.time) return true;
-    const t = new Date(c.time);
-    return !isNaN(t.getTime()) && t >= start && t <= end;
-  });
 }
 
 function generateEmotionOverview(analysis) {
@@ -267,46 +344,61 @@ function generateDoubts(topics, supplementaryFacts) {
     return ['未识别出明确质疑焦点，评论可能较为分散。'];
   }
   const lines = [];
-  let displayTopics = topics.slice();
-  if (supplementaryFacts && supplementaryFacts.length > 0) {
-    displayTopics.sort((a, b) => {
-      const aMatch = supplementaryFacts.some(f => a.pattern.test(f)) ? 1 : 0;
-      const bMatch = supplementaryFacts.some(f => b.pattern.test(f)) ? 1 : 0;
-      if (aMatch !== bMatch) return bMatch - aMatch;
-      return b.score - a.score;
-    });
+  const unaddressed = topics.filter(t => !t.addressed);
+  const addressed = topics.filter(t => t.addressed);
+
+  const MAX_UNADDRESSED = 5;
+  const MAX_ADDRESSED = 2;
+
+  const displayList = [];
+  for (let i = 0; i < Math.min(unaddressed.length, MAX_UNADDRESSED); i++) {
+    displayList.push(unaddressed[i]);
   }
-  const shown = Math.min(displayTopics.length, 6);
-  for (let i = 0; i < shown; i++) {
-    const t = displayTopics[i];
-    let line = `${i + 1}. ${t.question}`;
+  for (let i = 0; i < Math.min(addressed.length, MAX_ADDRESSED); i++) {
+    displayList.push(addressed[i]);
+  }
+
+  let displayedCount = 0;
+  for (const t of displayList) {
+    let prefix = `${displayedCount + 1}. `;
+    if (t.addressed) {
+      prefix = `${displayedCount + 1}. ✓ `;
+    }
+    let line = `${prefix}${t.question}`;
     const emotionDist = {};
     for (const h of t.hits) {
-      emotionDist[h.emotion] = (emotionDist[h.emotion] || 0) + 1;
+      if (h.emotion) {
+        emotionDist[h.emotion] = (emotionDist[h.emotion] || 0) + 1;
+      }
     }
-    const topEmo = Object.entries(emotionDist).sort((a, b) => b[1] - a[1])[0];
+    const topEmoEntries = Object.entries(emotionDist).sort((a, b) => b[1] - a[1]);
+    const topEmo = topEmoEntries.length > 0 ? topEmoEntries[0] : null;
     if (topEmo) {
       line += `（主要情绪：${EMOTION_CATEGORIES[topEmo[0]].label}，${t.hits.length}条相关）`;
+    } else if (t.hits.length > 0) {
+      line += `（${t.hits.length}条相关）`;
+    }
+    if (t.addressed) {
+      line += ` [已回应]`;
     }
     const sampleIdx = t.hits.findIndex(h => h.text.length > 10) || 0;
     const sample = t.hits[sampleIdx] || t.hits[0];
     if (sample) {
       const displayText = sample.text.length > 40 ? sample.text.substring(0, 40) + '…' : sample.text;
-      line += `\n   代表："${displayText}"`;
+      line += `\n      代表："${displayText}"`;
     }
-    if (supplementaryFacts && supplementaryFacts.length > 0) {
-      const factMatch = supplementaryFacts.find(f =>
-        t.pattern.test(f)
-      );
-      if (factMatch) {
-        const shortFact = factMatch.length > 35 ? factMatch.substring(0, 35) + '…' : factMatch;
-        line += `\n   ▶ 已有补充事实：${shortFact}`;
+    if (t.addressed && t.matchingFacts && t.matchingFacts.length > 0) {
+      for (const f of t.matchingFacts) {
+        const shortFact = f.length > 40 ? f.substring(0, 40) + '…' : f;
+        line += `\n      ▶ 已澄清：${shortFact}`;
       }
     }
     lines.push(line);
+    displayedCount++;
   }
-  if (displayTopics.length > 6) {
-    lines.push(`…另有 ${displayTopics.length - 6} 个次要质疑点。`);
+  const remaining = topics.length - displayList.length;
+  if (remaining > 0) {
+    lines.push(`…另有 ${remaining} 个次要质疑点。`);
   }
   return lines;
 }
@@ -319,13 +411,11 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
   const angerRatio = emotionAnalysis.percentages.anger || 0;
   const worryRatio = emotionAnalysis.percentages.worry || 0;
   const verifyRatio = emotionAnalysis.percentages.verify || 0;
-  const factCovered = supplementaryFacts && supplementaryFacts.length > 0;
+  const facts = supplementaryFacts || [];
+  const hasFacts = facts.length > 0;
 
-  const topTopic = topics[0];
-  const topEmo = topTopic.hits.length > 0
-    ? topTopic.hits.reduce((acc, h) => { acc[h.emotion] = (acc[h.emotion] || 0) + 1; return acc; }, {})
-    : {};
-  const topEmoKey = Object.entries(topEmo).sort((a, b) => b[1] - a[1])[0];
+  const unaddressed = topics.filter(t => !t.addressed);
+  const addressed = topics.filter(t => t.addressed);
 
   if (angerRatio >= 30) {
     lines.push('【紧急】公众愤怒情绪强烈，首要任务是回应最尖锐质疑以降温。');
@@ -337,32 +427,58 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
     lines.push('【一般】情绪尚可控，按质疑热度依次回应即可。');
   }
 
-  if (topTopic) {
-    if (topEmoKey && topEmoKey[0] === 'anger') {
-      lines.push(`→ 第一优先：回应"${topTopic.question}"——直接承认问题或给出调查结论，缓解对立。`);
-    } else if (topEmoKey && topEmoKey[0] === 'verify') {
-      lines.push(`→ 第一优先：回应"${topTopic.question}"——尽快公布权威数据或官方核实结果。`);
-    } else if (topEmoKey && topEmoKey[0] === 'worry') {
-      lines.push(`→ 第一优先：回应"${topTopic.question}"——明确安全措施和后续保障，安抚受影响群体。`);
-    } else {
-      lines.push(`→ 第一优先：回应"${topTopic.question}"。`);
+  let priorityRank = 1;
+  for (const t of unaddressed.slice(0, 3)) {
+    const emoDist = {};
+    for (const h of t.hits) {
+      if (h.emotion) {
+        emoDist[h.emotion] = (emoDist[h.emotion] || 0) + 1;
+      }
     }
+    const topEmoEntries = Object.entries(emoDist).sort((a, b) => b[1] - a[1]);
+    const topEmoKey = topEmoEntries.length > 0 ? topEmoEntries[0] : null;
+    const rankLabel = priorityRank === 1 ? '第一优先' : priorityRank === 2 ? '第二优先' : '第三优先';
+    let advice = '';
+    if (topEmoKey && topEmoKey[0] === 'anger') {
+      advice = '——直接承认问题或给出调查结论，缓解对立。';
+    } else if (topEmoKey && topEmoKey[0] === 'verify') {
+      advice = '——尽快公布权威数据或官方核实结果。';
+    } else if (topEmoKey && topEmoKey[0] === 'worry') {
+      advice = '——明确安全措施和后续保障，安抚受影响群体。';
+    }
+    lines.push(`→ ${rankLabel}：回应"${t.question}"${advice}`);
+    priorityRank++;
   }
 
-  if (topics.length > 1) {
-    const second = topics[1];
-    lines.push(`→ 第二优先：回应"${second.question}"。`);
-  }
+  if (hasFacts) {
+    if (addressed.length > 0) {
+      const addressedLabels = addressed.slice(0, 3).map(t => `"${t.question}"`).join('、');
+      lines.push(`✓ 已覆盖：${addressedLabels}${addressed.length > 3 ? ` 等${addressed.length}项` : ''}，可暂不作为重点。`);
+    }
 
-  if (!factCovered) {
+    const neededCategories = new Set();
+    for (const t of unaddressed) {
+      for (const [emo, w] of Object.entries(t.emotionWeight || {})) {
+        if (w >= 1.5) {
+          if (emo === 'verify') neededCategories.add('权威事实与数据');
+          if (emo === 'worry') neededCategories.add('安全保障与安抚信息');
+          if (emo === 'anger') neededCategories.add('问责与处理进展');
+        }
+      }
+    }
+    if (unaddressed.length > 0 && neededCategories.size > 0) {
+      const hint = Array.from(neededCategories).join('、');
+      lines.push(`▶ 下一步建议补充：${hint}，以覆盖剩余质疑。`);
+    } else if (unaddressed.length === 0) {
+      lines.push('✓ 所有主要质疑均已回应，可转入持续监测。');
+    }
+  } else {
     if (angerRatio > 20 && verifyRatio > 15) {
       lines.push('→ 建议优先解释事实误差和统计口径差异，降低信任损耗。');
     }
     if (worryRatio > 20) {
       lines.push('→ 建议同步发布受影响群体安置和善后措施，降低恐慌蔓延。');
     }
-  } else {
-    lines.push('→ 已纳入补充事实，以上建议已调整。可继续输入事实以进一步校准。');
   }
 
   if (angerRatio > 40) {
@@ -372,13 +488,15 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
   return lines;
 }
 
-function runAnalysis(eventName, timeRange, filePath, supplementaryFacts) {
-  let comments = parseFile(filePath);
+function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
+  const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
+  const { comments: rawComments, fileStats } = parseFiles(paths);
+  let comments = rawComments;
   if (timeRange) {
     comments = filterByTimeRange(comments, timeRange);
   }
   const emotionAnalysis = analyzeEmotions(comments);
-  const topics = extractTopics(comments);
+  const topics = extractTopics(comments, supplementaryFacts);
   const emotionOverview = generateEmotionOverview(emotionAnalysis);
   const doubts = generateDoubts(topics, supplementaryFacts);
   const priority = generatePriority(topics, emotionAnalysis, supplementaryFacts);
@@ -386,20 +504,26 @@ function runAnalysis(eventName, timeRange, filePath, supplementaryFacts) {
     eventName,
     timeRange,
     commentCount: comments.length,
+    fileStats,
     emotionOverview,
     doubts,
     priority,
     emotionAnalysis,
-    topics
+    topics,
+    supplementaryFacts: supplementaryFacts || []
   };
 }
 
 module.exports = {
   parseFile,
+  parseFiles,
   classifyEmotion,
   analyzeEmotions,
   extractTopics,
   filterByTimeRange,
+  normalizeDateStart,
+  normalizeDateEnd,
+  parseCommentTime,
   generateEmotionOverview,
   generateDoubts,
   generatePriority,
