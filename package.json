@@ -1,6 +1,6 @@
 {
   "name": "crisis-pulse",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "舆情危机快速分析命令行工具",
   "main": "src/index.js",
   "bin": {

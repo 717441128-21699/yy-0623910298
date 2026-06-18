@@ -3,18 +3,32 @@
 
 const readline = require('readline');
 const path = require('path');
+const fs = require('fs');
 const {
   runAnalysis,
+  compareAnalysis,
+  getEscalationLevel,
+  buildHandoverPackage,
   parseBatchConfig,
   runBatchAnalysis,
   exportBatchReport,
-  generateBatchSummary
+  generateBatchSummary,
+  parseTaggedFact,
+  FACT_TAGS
 } = require('./analyzer');
 const {
   formatReport,
   formatBriefUpdate,
+  formatCompareReport,
+  formatCompareMarkdown,
   exportReport
 } = require('./report');
+
+let VERSION = 'v1.3';
+try {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8'));
+  VERSION = `v${pkg.version}`;
+} catch (e) {}
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -48,16 +62,72 @@ function listFacts(facts) {
     console.log('  (暂无已录入事实)');
     return;
   }
-  console.log(`  已录入 ${facts.length} 条补充事实:`);
-  for (let i = 0; i < facts.length; i++) {
-    console.log(`    ${i + 1}. ${facts[i]}`);
+  const tagged = facts.filter(f => typeof f !== 'string' && f.tag);
+  const untagged = facts.filter(f => typeof f === 'string' || !f.tag);
+  if (tagged.length > 0) {
+    const groups = {};
+    for (const f of tagged) {
+      const tag = f.tag || '未分类';
+      if (!groups[tag]) groups[tag] = [];
+      groups[tag].push(f);
+    }
+    for (const [tag, items] of Object.entries(groups)) {
+      console.log(`  [${tag}]`);
+      for (const f of items) {
+        const idx = facts.indexOf(f) + 1;
+        console.log(`    ${idx}. ${f.text}`);
+      }
+    }
   }
+  if (untagged.length > 0) {
+    console.log('  [未标签]');
+    for (const f of untagged) {
+      const idx = facts.indexOf(f) + 1;
+      const text = typeof f === 'string' ? f : f.text;
+      console.log(`    ${idx}. ${text}`);
+    }
+  }
+  console.log(`  共 ${facts.length} 条`);
+  const tagCoverage = buildTagCoverage(facts);
+  if (Object.keys(tagCoverage).length > 0) {
+    console.log('');
+    console.log('  标签覆盖情况:');
+    for (const [tag, info] of Object.entries(tagCoverage)) {
+      const status = info.covered ? '✓' : '✗';
+      console.log(`    ${status} ${tag}: ${info.topics.join('、') || '无关联质疑'}`);
+    }
+  }
+}
+
+function buildTagCoverage(facts) {
+  const { TOPIC_PATTERNS, EMOTION_CATEGORIES } = require('./analyzer');
+  const tagged = facts.filter(f => typeof f !== 'string' && f.tag);
+  const coverage = {};
+  for (const [tagName, tagPattern] of Object.entries(FACT_TAGS)) {
+    const relatedTopics = [];
+    let hasCoverage = false;
+    for (const tp of TOPIC_PATTERNS) {
+      if (tagPattern.test(tp.question) || tagPattern.test(tp.label)) {
+        const isCovered = tagged.some(f => f.tag === tagName && tp.pattern.test(f.text));
+        if (isCovered) {
+          hasCoverage = true;
+          relatedTopics.push(tp.question);
+        } else {
+          relatedTopics.push(tp.question);
+        }
+      }
+    }
+    if (relatedTopics.length > 0) {
+      coverage[tagName] = { covered: hasCoverage, topics: relatedTopics };
+    }
+  }
+  return coverage;
 }
 
 async function runBatchMode() {
   console.log('');
   console.log('═'.repeat(52));
-  console.log('  CrisisPulse · 批量日报模式');
+  console.log(`  CrisisPulse · 批量日报模式 ${VERSION}`);
   console.log('═'.repeat(52));
   console.log('');
 
@@ -109,15 +179,16 @@ async function runBatchMode() {
   console.log(`  ✓ 汇总报告已导出:`);
   console.log(`    ${summaryFiles.txt.filename}`);
   console.log(`    ${summaryFiles.md.filename}`);
+
   console.log('');
-  console.log('═'.repeat(52));
-  console.log('  交班速览:');
-  console.log('═'.repeat(52));
-  for (const r of batchResult.results) {
-    const s = r.result.summary;
-    console.log(`  ${r.event}  |  ${s.topEmotionLabel}${s.topEmotionRatio}%  |  ${s.firstPriority}`);
+  const handoverInput = await question('  是否生成交班包？(y/n，默认y): ');
+  if (handoverInput.trim().toLowerCase() !== 'n') {
+    const pkg = buildHandoverPackage(batchResult, configPath.trim());
+    console.log('');
+    console.log(pkg.handoverSummary);
+    console.log(`  ✓ 交班包清单已保存: ${pkg.manifestPath}`);
   }
-  console.log('═'.repeat(52));
+
   console.log('');
   console.log('  批量处理完成，所有文件已保存到指定目录。');
   console.log('');
@@ -144,7 +215,7 @@ function parseSaveCommand(input) {
 async function runSingleMode() {
   console.log('');
   console.log('═'.repeat(52));
-  console.log('  CrisisPulse · 舆情危机快速分析工具 v1.2');
+  console.log(`  CrisisPulse · 舆情危机快速分析工具 ${VERSION}`);
   console.log('═'.repeat(52));
   console.log('');
 
@@ -178,6 +249,7 @@ async function runSingleMode() {
   console.log(formatReport(result));
 
   const supplementaryFacts = [];
+  let previousResult = null;
 
   while (true) {
     console.log('');
@@ -203,12 +275,57 @@ async function runSingleMode() {
       continue;
     }
 
+    if (lower.startsWith('/diff') || lower.startsWith('/compare')) {
+      const parts = input.split(/\s+/);
+      if (parts.length >= 2) {
+        const beforePaths = parseFilePaths(parts.slice(1).join(' '));
+        if (beforePaths.length === 0) {
+          console.log('  请提供前期评论文件路径。');
+          continue;
+        }
+        try {
+          previousResult = runAnalysis(eventName.trim(), timeRange.trim(), beforePaths, []);
+          console.log(`  ✓ 已设置对比基准 (${previousResult.commentCount} 条评论)`);
+          console.log('  再次输入 /diff 即可与当前分析结果对比。');
+        } catch (err) {
+          console.log(`  ✗ 读取前期文件失败: ${err.message}`);
+        }
+        continue;
+      }
+      if (!previousResult) {
+        console.log('  尚未设置对比基准。请先使用 /diff 前期文件路径 设置基准。');
+        console.log('  用法: /diff 前期评论文件路径[,文件2,...]');
+        continue;
+      }
+      try {
+        const compareResult = compareAnalysis(previousResult, result);
+        console.log(formatCompareReport(compareResult, eventName.trim()));
+
+        const exportDiff = await question('  是否导出对比报告？(y/n，默认n): ');
+        if (exportDiff.trim().toLowerCase() === 'y') {
+          const dirInput = await question('  保存目录 (留空为当前目录): ');
+          const dir = dirInput.trim() || process.cwd();
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+          const safeName = eventName.trim().replace(/[\\/:*?"<>|]/g, '_');
+          const txtPath = path.join(dir, `复盘对比_${safeName}_${ts}.txt`);
+          const mdPath = path.join(dir, `复盘对比_${safeName}_${ts}.md`);
+          fs.writeFileSync(txtPath, formatCompareReport(compareResult, eventName.trim()), 'utf-8');
+          fs.writeFileSync(mdPath, formatCompareMarkdown(compareResult, eventName.trim()), 'utf-8');
+          console.log(`  ✓ 已导出: ${path.basename(txtPath)} / ${path.basename(mdPath)}`);
+        }
+      } catch (err) {
+        console.log(`  ✗ 对比失败: ${err.message}`);
+      }
+      continue;
+    }
+
     if (lower === '/undo' || lower === '/pop') {
       if (supplementaryFacts.length === 0) {
         console.log('  （事实列表为空，无法撤回）');
       } else {
         const popped = supplementaryFacts.pop();
-        console.log(`  ✓ 已撤回: ${popped}`);
+        const poppedText = typeof popped === 'string' ? popped : popped.text;
+        console.log(`  ✓ 已撤回: ${poppedText}`);
         try {
           const updated = runAnalysis(eventName.trim(), timeRange.trim(), filePaths, supplementaryFacts);
           result = updated;
@@ -234,10 +351,12 @@ async function runSingleMode() {
         continue;
       }
       const old = supplementaryFacts[idx];
-      supplementaryFacts[idx] = newContent;
+      const oldText = typeof old === 'string' ? old : old.text;
+      const tagged = parseTaggedFact(newContent);
+      supplementaryFacts[idx] = tagged;
       console.log(`  ✓ 已替换第 ${idx + 1} 条:`);
-      console.log(`    旧: ${old}`);
-      console.log(`    新: ${newContent}`);
+      console.log(`    旧: ${oldText}`);
+      console.log(`    新: ${tagged.text}${tagged.tag ? ` [${tagged.tag}]` : ''}`);
       try {
         const updated = runAnalysis(eventName.trim(), timeRange.trim(), filePaths, supplementaryFacts);
         result = updated;
@@ -265,6 +384,29 @@ async function runSingleMode() {
       continue;
     }
 
+    if (lower.startsWith('/tag')) {
+      const tagContent = input.replace(/^\/tag\s+/i, '');
+      if (!tagContent.trim()) {
+        console.log('  可用标签:');
+        for (const [tag, pattern] of Object.entries(FACT_TAGS)) {
+          console.log(`    #${tag}`);
+        }
+        console.log('  也可使用自定义标签: /tag #自定义标签 事实内容');
+        continue;
+      }
+      const tagged = parseTaggedFact(tagContent.startsWith('#') ? tagContent : `#未分类 ${tagContent}`);
+      supplementaryFacts.push(tagged);
+      console.log(`  ✓ 已添加: ${tagged.text} [${tagged.tag}]`);
+      try {
+        const updated = runAnalysis(eventName.trim(), timeRange.trim(), filePaths, supplementaryFacts);
+        result = updated;
+        console.log(formatBriefUpdate(updated));
+      } catch (err) {
+        console.log(`  错误: ${err.message}`);
+      }
+      continue;
+    }
+
     if (lower.startsWith('/save')) {
       const opts = parseSaveCommand(input);
       let displayMode = '完整报告';
@@ -282,16 +424,21 @@ async function runSingleMode() {
 
     if (lower === '/help' || lower === '/h' || lower === 'help') {
       console.log('  可用命令:');
-      console.log('    /facts  /list              查看已录入事实列表');
+      console.log('    /facts  /list              查看已录入事实列表（按标签分组）');
+      console.log('    /tag #标签 内容            添加带标签的补充事实');
+      console.log('    /tag                       查看可用标签列表');
       console.log('    /undo   /pop               撤回最后一条事实并重新分析');
       console.log('    /replace N 新内容          替换第 N 条事实并重新分析');
       console.log('    /reset  /clear             清空所有补充事实');
+      console.log('    /diff 前期文件路径         设置对比基准（如昨天的评论文件）');
+      console.log('    /diff                      与当前结果对比（设置基准后）');
       console.log('    /save [txt|md] [full|brief|priority] [目录]');
       console.log('                                导出报告 (full完整, brief简版, priority仅建议)');
       console.log('    /batch                     切换到批量日报模式');
       console.log('    /quit  /q                  退出程序');
       console.log('    /help  /h                  显示帮助');
       console.log('    直接输入文字                作为补充事实重新生成报告');
+      console.log('    #标签 内容                 快捷方式：直接添加带标签的事实');
       continue;
     }
 
@@ -300,7 +447,8 @@ async function runSingleMode() {
       continue;
     }
 
-    supplementaryFacts.push(input);
+    const tagged = parseTaggedFact(input);
+    supplementaryFacts.push(tagged);
     try {
       const updated = runAnalysis(
         eventName.trim(),

@@ -14,10 +14,15 @@ const {
   parseCommentTime,
   analyzeTrend,
   runAnalysis,
+  compareAnalysis,
+  getEscalationLevel,
+  buildHandoverPackage,
   parseBatchConfig,
   runBatchAnalysis,
   generateBatchSummary,
-  exportBatchReport
+  exportBatchReport,
+  parseTaggedFact,
+  FACT_TAGS
 } = require('../src/analyzer');
 const {
   formatReport,
@@ -27,6 +32,8 @@ const {
   formatMarkdown,
   formatMarkdownBrief,
   formatMarkdownPriority,
+  formatCompareReport,
+  formatCompareMarkdown,
   exportReport,
   sanitizeFilename,
   timestampForFile
@@ -175,6 +182,12 @@ function testExtractTopicsWithFacts() {
 
   const orderedIds = withFacts2.filter(t => !t.addressed).map(t => t.id);
   assert(orderedIds[0] !== 'casualty_accuracy', `已澄清的话题不应在未回应列表顶部`);
+
+  const taggedFacts = [{ text: '伤亡数字已核实为5人', tag: '伤亡数据' }];
+  const withTagged = extractTopics(comments, taggedFacts);
+  const casualtyTagged = withTagged.find(t => t.id === 'casualty_accuracy');
+  assert(casualtyTagged && casualtyTagged.addressed === true, `标签事实也能标记addressed`);
+  assert(casualtyTagged.matchingTags && casualtyTagged.matchingTags.includes('伤亡数据'), `应记录matchingTags`);
 }
 
 function testGenerateDoubtsWithAddressed() {
@@ -215,6 +228,15 @@ function testGeneratePriorityWithFacts() {
   const firstPriorityLine = lines.find(l => l.includes('第一优先'));
   assert(firstPriorityLine && !firstPriorityLine.includes('伤亡数字'),
     `第一优先不应再是已澄清的伤亡数字问题, 实际为: ${firstPriorityLine}`);
+
+  const taggedFacts = [{ text: '伤亡数字已核实为5人', tag: '伤亡数据' }];
+  const topicsTagged = extractTopics([
+    { text: '伤亡数字瞒报了吗', time: '' },
+    { text: '通报太慢', time: '' }
+  ], taggedFacts);
+  const linesTagged = generatePriority(topicsTagged, emotionResult, taggedFacts);
+  const textTagged = linesTagged.join('\n');
+  assert(textTagged.includes('已覆盖标签：伤亡数据') || textTagged.includes('伤亡数据'), `标签事实应显示已覆盖标签`);
 }
 
 function testRunWithTrend() {
@@ -387,6 +409,103 @@ function testSanitizeFilename() {
   assert(sanitizeFilename('').length > 0, `空名称应有默认值`);
 }
 
+function testParseTaggedFact() {
+  console.log('\n[parseTaggedFact]');
+  const r1 = parseTaggedFact('#伤亡数据 伤亡数字已核实为5人');
+  assert(r1.text === '伤亡数字已核实为5人', `应解析文本`);
+  assert(r1.tag === '伤亡数据', `应解析标签`);
+
+  const r2 = parseTaggedFact('普通事实没有标签');
+  assert(r2.text === '普通事实没有标签', `无标签应保留文本`);
+  assert(r2.tag === '', `无标签时tag应为空`);
+
+  const r3 = parseTaggedFact('#善后赔偿 赔偿方案已公布');
+  assert(r3.tag === '善后赔偿', `自定义标签应被解析`);
+}
+
+function testCompareAnalysis() {
+  console.log('\n[compareAnalysis]');
+  const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
+  const f2 = path.join(__dirname, '..', 'samples', 'weibo_comments.txt');
+
+  const resultBefore = runAnalysis('测试', '', f1, []);
+  const resultAfter = runAnalysis('测试', '', [f1, f2], []);
+
+  const compare = compareAnalysis(resultBefore, resultAfter);
+  assert(compare.commentCountBefore === 30, `前期应为30条`);
+  assert(compare.commentCountAfter === 40, `本期应为40条`);
+  assert(compare.summary && compare.summary.length > 0, `应有对比摘要`);
+  assert(Array.isArray(compare.emotionChanges), `应返回emotionChanges数组`);
+  assert(Array.isArray(compare.newTopics), `应返回newTopics数组`);
+  assert(Array.isArray(compare.escalatedTopics), `应返回escalatedTopics数组`);
+  assert(Array.isArray(compare.resolvedTopics), `应返回resolvedTopics数组`);
+}
+
+function testEscalationLevel() {
+  console.log('\n[getEscalationLevel]');
+  const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
+  const result = runAnalysis('测试', '', f1, []);
+  const level = getEscalationLevel(result);
+  assert(level === '🔴' || level === '🟡' || level === '🟢', `升级级别应为🔴/🟡/🟢之一，实际${level}`);
+}
+
+function testHandoverPackage() {
+  console.log('\n[buildHandoverPackage]');
+  const events = [
+    { name: '事件A', timeRange: '', filePaths: [path.join(__dirname, '..', 'samples', 'crisis_comments.txt')] }
+  ];
+  const tmpDir = path.join(__dirname, '..', 'tmp_handover_test');
+  try {
+    const batchResult = runBatchAnalysis(events, tmpDir);
+    const pkg = buildHandoverPackage(batchResult, path.join(__dirname, '..', 'samples', 'batch_config.txt'));
+
+    assert(pkg.manifestPath && pkg.manifestPath.length > 0, `应有清单路径`);
+    assert(pkg.handoverSummary && pkg.handoverSummary.length > 0, `应有交班摘要`);
+    assert(pkg.handoverSummary.includes('交班摘要'), `摘要应包含标题`);
+    assert(pkg.escalationStats, `应有升级统计`);
+    assert(typeof pkg.escalationStats.escalateCount === 'number', `应有escalateCount`);
+    assert(typeof pkg.escalationStats.watchCount === 'number', `应有watchCount`);
+    assert(typeof pkg.escalationStats.okCount === 'number', `应有okCount`);
+    assert(fs.existsSync(pkg.manifestPath), `清单文件应存在`);
+
+    for (const r of batchResult.results) {
+      for (const f of r.files) {
+        try { fs.unlinkSync(f.path); } catch (_) {}
+      }
+    }
+    const summaryFiles = exportBatchReport(batchResult, tmpDir);
+    try { fs.unlinkSync(summaryFiles.txt.path); } catch (_) {}
+    try { fs.unlinkSync(summaryFiles.md.path); } catch (_) {}
+    try {
+      const files = fs.readdirSync(tmpDir);
+      for (const f of files) { try { fs.unlinkSync(path.join(tmpDir, f)); } catch (_) {} }
+      fs.rmdirSync(tmpDir);
+    } catch (_) {}
+  } catch (e) {
+    assert(false, `交班包异常: ${e.message}`);
+    try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+  }
+}
+
+function testFormatCompareReport() {
+  console.log('\n[formatCompareReport]');
+  const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
+  const f2 = path.join(__dirname, '..', 'samples', 'weibo_comments.txt');
+
+  const resultBefore = runAnalysis('测试', '', f1, []);
+  const resultAfter = runAnalysis('测试', '', [f1, f2], []);
+
+  const compare = compareAnalysis(resultBefore, resultAfter);
+  const report = formatCompareReport(compare, '测试事件');
+  assert(report.includes('复盘对比'), `报告应包含复盘对比标题`);
+  assert(report.includes('测试事件'), `报告应包含事件名称`);
+  assert(report.includes('前期评论'), `报告应包含评论数量对比`);
+
+  const md = formatCompareMarkdown(compare, '测试事件');
+  assert(md.includes('# 复盘对比'), `md报告应含标题`);
+  assert(md.includes('复盘对比'), `md报告应含复盘对比`);
+}
+
 function testBriefUpdateWithTrend() {
   console.log('\n[formatBriefUpdate trend]');
   const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
@@ -397,7 +516,7 @@ function testBriefUpdateWithTrend() {
   assert(brief.includes('数据源'), `更新报告也应显示多文件数据源`);
 }
 
-console.log('CrisisPulse 测试 v1.2');
+console.log('CrisisPulse 测试 v1.3');
 console.log('═'.repeat(40));
 
 testParseFile();
@@ -421,6 +540,11 @@ testBatchConfig();
 testRunBatchAnalysis();
 testSanitizeFilename();
 testBriefUpdateWithTrend();
+testParseTaggedFact();
+testCompareAnalysis();
+testEscalationLevel();
+testHandoverPackage();
+testFormatCompareReport();
 
 console.log('\n' + '═'.repeat(40));
 console.log(`  通过: ${passed}  失败: ${failed}`);

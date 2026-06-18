@@ -105,14 +105,35 @@ function formatReport(result, mode) {
     lines.push(DIVIDER);
     lines.push('  附：已录入补充事实');
     lines.push(DIVIDER);
-    for (let i = 0; i < result.supplementaryFacts.length; i++) {
-      lines.push(`  ${i + 1}. ${result.supplementaryFacts[i]}`);
+    const facts = result.supplementaryFacts;
+    const tagged = facts.filter(f => typeof f !== 'string' && f.tag);
+    const untagged = facts.filter(f => typeof f === 'string' || !f.tag);
+    if (tagged.length > 0) {
+      const groups = {};
+      for (const f of tagged) {
+        const tag = f.tag || '未分类';
+        if (!groups[tag]) groups[tag] = [];
+        groups[tag].push(f.text);
+      }
+      for (const [tag, items] of Object.entries(groups)) {
+        lines.push(`  [${tag}]`);
+        for (const item of items) {
+          lines.push(`    · ${item}`);
+        }
+      }
+    }
+    if (untagged.length > 0) {
+      lines.push(`  [未标签]`);
+      for (const f of untagged) {
+        const text = typeof f === 'string' ? f : f.text;
+        lines.push(`    · ${text}`);
+      }
     }
     lines.push('');
   }
 
   lines.push(DOUBLE_DIVIDER);
-  lines.push('  命令: /facts 查看事实  /undo 撤回  /replace N 新内容  /save 导出  /quit 退出  /help 帮助');
+  lines.push('  命令: /facts 查看  /tag #标签 内容  /diff 对比  /save 导出  /quit 退出  /help 帮助');
   lines.push(DOUBLE_DIVIDER);
 
   return lines.join('\n');
@@ -382,6 +403,112 @@ function formatMarkdownPriority(result) {
   return lines.join('\n');
 }
 
+function formatCompareReport(compareResult, eventName) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+
+  lines.push(DOUBLE_DIVIDER);
+  lines.push(`  复盘对比 · ${eventName || '事件'}`);
+  lines.push(`  ${now}`);
+  lines.push(DOUBLE_DIVIDER);
+  lines.push('');
+  lines.push(`  前期评论: ${compareResult.commentCountBefore} 条 → 本期: ${compareResult.commentCountAfter} 条`);
+  lines.push(`  ${compareResult.summary}`);
+  lines.push('');
+
+  if (compareResult.emotionChanges.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  情绪变化');
+    lines.push(DIVIDER);
+    for (const e of compareResult.emotionChanges) {
+      const arrow = e.diff > 0 ? '↑' : '↓';
+      lines.push(`  ${arrow} ${e.label}: ${e.before}% → ${e.after}% (${e.diff > 0 ? '+' : ''}${e.diff}%)`);
+    }
+    lines.push('');
+  }
+
+  if (compareResult.escalatedTopics.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  质疑升温');
+    lines.push(DIVIDER);
+    for (const t of compareResult.escalatedTopics) {
+      lines.push(`  ↑ ${t.question}: ${t.beforeHits}条 → ${t.afterHits}条`);
+    }
+    lines.push('');
+  }
+
+  if (compareResult.newTopics.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  新增高频问题');
+    lines.push(DIVIDER);
+    for (const t of compareResult.newTopics) {
+      lines.push(`  + ${t.question}（${t.hits.length}条相关）`);
+    }
+    lines.push('');
+  }
+
+  if (compareResult.resolvedTopics.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  已消退质疑');
+    lines.push(DIVIDER);
+    for (const t of compareResult.resolvedTopics) {
+      lines.push(`  - ${t.question}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(DOUBLE_DIVIDER);
+  return lines.join('\n');
+}
+
+function formatCompareMarkdown(compareResult, eventName) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+  lines.push(`# 复盘对比 · ${eventName || '事件'}`);
+  lines.push('');
+  lines.push(`> ${now} | 前期 ${compareResult.commentCountBefore} 条 → 本期 ${compareResult.commentCountAfter} 条`);
+  lines.push('');
+  lines.push(compareResult.summary);
+  lines.push('');
+  if (compareResult.emotionChanges.length > 0) {
+    lines.push('## 情绪变化');
+    lines.push('');
+    lines.push('| 情绪 | 前期 | 本期 | 变化 |');
+    lines.push('| ---- | ---- | ---- | ---- |');
+    for (const e of compareResult.emotionChanges) {
+      lines.push(`| ${e.label} | ${e.before}% | ${e.after}% | ${e.diff > 0 ? '+' : ''}${e.diff}% |`);
+    }
+    lines.push('');
+  }
+  if (compareResult.escalatedTopics.length > 0) {
+    lines.push('## 质疑升温');
+    lines.push('');
+    for (const t of compareResult.escalatedTopics) {
+      lines.push(`- **${t.question}**: ${t.beforeHits}条 → ${t.afterHits}条`);
+    }
+    lines.push('');
+  }
+  if (compareResult.newTopics.length > 0) {
+    lines.push('## 新增高频问题');
+    lines.push('');
+    for (const t of compareResult.newTopics) {
+      lines.push(`- ${t.question}（${t.hits.length}条相关）`);
+    }
+    lines.push('');
+  }
+  if (compareResult.resolvedTopics.length > 0) {
+    lines.push('## 已消退质疑');
+    lines.push('');
+    for (const t of compareResult.resolvedTopics) {
+      lines.push(`- ~~${t.question}~~`);
+    }
+    lines.push('');
+  }
+  lines.push('---');
+  lines.push(`*由 CrisisPulse 于 ${now} 生成*`);
+  return lines.join('\n');
+}
+
 function exportReport(result, format, outputDir, mode) {
   const fmt = (format || 'txt').toLowerCase();
   const exportMode = mode || 'full';
@@ -420,6 +547,8 @@ module.exports = {
   formatMarkdown,
   formatMarkdownBrief,
   formatMarkdownPriority,
+  formatCompareReport,
+  formatCompareMarkdown,
   exportReport,
   timestampForFile,
   sanitizeFilename,

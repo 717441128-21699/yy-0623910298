@@ -266,18 +266,41 @@ function analyzeEmotions(comments) {
   return { counts, percentages, total, taggedComments };
 }
 
+const FACT_TAGS = {
+  '伤亡数据': /伤亡|死亡|遇难|失踪|受伤|人数|数字|统计|数据/,
+  '通报进展': /通报|发布|公布|说明|回应|进展|最新/,
+  '善后赔偿': /赔偿|补偿|安置|善后|抚恤|理赔/,
+  '问责处理': /追责|问责|免职|处分|撤职|逮捕|拘留|控制|严惩/,
+  '安全措施': /安全|预防|整改|防范|排查|措施|保障/,
+  '救援行动': /救援|救助|抢险|应急|出动|搜救/
+};
+
+function parseTaggedFact(input) {
+  const match = input.match(/^#(\S+)\s+(.+)$/);
+  if (match) {
+    return { text: match[2].trim(), tag: match[1] };
+  }
+  return { text: input.trim(), tag: '' };
+}
+
 function extractTopics(comments, supplementaryFacts) {
   const facts = supplementaryFacts || [];
+  const factTexts = facts.map(f => typeof f === 'string' ? f : f.text);
   const topicHits = {};
   for (const tp of TOPIC_PATTERNS) {
-    topicHits[tp.id] = { ...tp, hits: [], score: 0, addressed: false, matchingFacts: [] };
+    topicHits[tp.id] = { ...tp, hits: [], score: 0, addressed: false, matchingFacts: [], matchingTags: [] };
   }
   for (const f of facts) {
+    const fText = typeof f === 'string' ? f : f.text;
+    const fTag = typeof f === 'string' ? '' : (f.tag || '');
     for (const tp of TOPIC_PATTERNS) {
-      if (tp.pattern.test(f)) {
+      if (tp.pattern.test(fText)) {
         topicHits[tp.id].addressed = true;
-        if (!topicHits[tp.id].matchingFacts.includes(f)) {
-          topicHits[tp.id].matchingFacts.push(f);
+        if (!topicHits[tp.id].matchingFacts.includes(fText)) {
+          topicHits[tp.id].matchingFacts.push(fText);
+        }
+        if (fTag && !topicHits[tp.id].matchingTags.includes(fTag)) {
+          topicHits[tp.id].matchingTags.push(fTag);
         }
       }
     }
@@ -412,8 +435,9 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
   const angerRatio = emotionAnalysis.percentages.anger || 0;
   const worryRatio = emotionAnalysis.percentages.worry || 0;
   const verifyRatio = emotionAnalysis.percentages.verify || 0;
-  const facts = supplementaryFacts || [];
+  const facts = (supplementaryFacts || []).map(f => typeof f === 'string' ? f : f.text);
   const hasFacts = facts.length > 0;
+  const taggedFacts = (supplementaryFacts || []).filter(f => typeof f !== 'string' && f.tag);
 
   const unaddressed = topics.filter(t => !t.addressed);
   const addressed = topics.filter(t => t.addressed);
@@ -453,11 +477,23 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
 
   if (hasFacts) {
     if (addressed.length > 0) {
-      const addressedLabels = addressed.slice(0, 3).map(t => `"${t.question}"`).join('、');
+      const addressedLabels = addressed.slice(0, 3).map(t => {
+        const tags = t.matchingTags && t.matchingTags.length > 0 ? `[${t.matchingTags.join(',')}]` : '';
+        return `"${t.question}"${tags}`;
+      }).join('、');
       lines.push(`✓ 已覆盖：${addressedLabels}${addressed.length > 3 ? ` 等${addressed.length}项` : ''}，可暂不作为重点。`);
     }
 
+    const coveredTagSet = new Set();
+    for (const t of addressed) {
+      for (const tag of (t.matchingTags || [])) coveredTagSet.add(tag);
+    }
+    if (coveredTagSet.size > 0) {
+      lines.push(`✓ 已覆盖标签：${Array.from(coveredTagSet).join('、')}`);
+    }
+
     const neededCategories = new Set();
+    const neededTags = new Set();
     for (const t of unaddressed) {
       for (const [emo, w] of Object.entries(t.emotionWeight || {})) {
         if (w >= 1.5) {
@@ -466,10 +502,17 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
           if (emo === 'anger') neededCategories.add('问责与处理进展');
         }
       }
+      for (const [tagName, tagPattern] of Object.entries(FACT_TAGS)) {
+        if (tagPattern.test(t.question) && !coveredTagSet.has(tagName)) {
+          neededTags.add(tagName);
+        }
+      }
     }
-    if (unaddressed.length > 0 && neededCategories.size > 0) {
-      const hint = Array.from(neededCategories).join('、');
-      lines.push(`▶ 下一步建议补充：${hint}，以覆盖剩余质疑。`);
+    if (unaddressed.length > 0 && (neededCategories.size > 0 || neededTags.size > 0)) {
+      const parts = [];
+      if (neededCategories.size > 0) parts.push(Array.from(neededCategories).join('、'));
+      if (neededTags.size > 0) parts.push(`标签 ${Array.from(neededTags).join('、')} 方向的事实`);
+      lines.push(`▶ 下一步建议补充：${parts.join('，')}，以覆盖剩余质疑。`);
     } else if (unaddressed.length === 0) {
       lines.push('✓ 所有主要质疑均已回应，可转入持续监测。');
     }
@@ -624,6 +667,186 @@ function analyzeTrend(comments) {
   };
 }
 
+function compareAnalysis(resultBefore, resultAfter) {
+  const lines = [];
+  const eaBefore = resultBefore.emotionAnalysis;
+  const eaAfter = resultAfter.emotionAnalysis;
+
+  const emotionChanges = [];
+  for (const emo of ['anger', 'worry', 'verify', 'onlook']) {
+    const diff = eaAfter.percentages[emo] - eaBefore.percentages[emo];
+    if (Math.abs(diff) >= 5) {
+      emotionChanges.push({
+        emotion: emo,
+        label: EMOTION_CATEGORIES[emo].label,
+        before: eaBefore.percentages[emo],
+        after: eaAfter.percentages[emo],
+        diff
+      });
+    }
+  }
+
+  const topicsBefore = resultBefore.topics || [];
+  const topicsAfter = resultAfter.topics || [];
+  const topicMapBefore = {};
+  for (const t of topicsBefore) topicMapBefore[t.id] = t;
+  const topicMapAfter = {};
+  for (const t of topicsAfter) topicMapAfter[t.id] = t;
+
+  const newTopics = [];
+  const escalatedTopics = [];
+  const resolvedTopics = [];
+  const stableTopics = [];
+
+  for (const t of topicsAfter) {
+    if (!topicMapBefore[t.id]) {
+      newTopics.push(t);
+    } else {
+      const beforeScore = topicMapBefore[t.id].hits.length;
+      const afterScore = t.hits.length;
+      if (afterScore > beforeScore * 1.5) {
+        escalatedTopics.push({ ...t, beforeHits: beforeScore, afterHits: afterScore });
+      } else {
+        stableTopics.push(t);
+      }
+    }
+  }
+  for (const t of topicsBefore) {
+    if (!topicMapAfter[t.id]) {
+      resolvedTopics.push(t);
+    }
+  }
+
+  return {
+    emotionChanges,
+    newTopics,
+    escalatedTopics,
+    resolvedTopics,
+    stableTopics,
+    commentCountBefore: resultBefore.commentCount,
+    commentCountAfter: resultAfter.commentCount,
+    summary: buildCompareSummary(emotionChanges, newTopics, escalatedTopics, resolvedTopics)
+  };
+}
+
+function buildCompareSummary(emotionChanges, newTopics, escalatedTopics, resolvedTopics) {
+  const parts = [];
+  if (emotionChanges.length > 0) {
+    const rising = emotionChanges.filter(e => e.diff > 0);
+    if (rising.length > 0) {
+      parts.push(rising.map(e => `${e.label}(+${Math.abs(e.diff)}%)`).join('、') + '上升');
+    }
+    const falling = emotionChanges.filter(e => e.diff < 0);
+    if (falling.length > 0) {
+      parts.push(falling.map(e => `${e.label}(${e.diff}%)`).join('、') + '回落');
+    }
+  }
+  if (newTopics.length > 0) {
+    parts.push(`新增质疑${newTopics.map(t => `"${t.question}"`).join('、')}`);
+  }
+  if (escalatedTopics.length > 0) {
+    parts.push(`升温质疑${escalatedTopics.map(t => `"${t.question}"`).join('、')}`);
+  }
+  if (resolvedTopics.length > 0) {
+    parts.push(`${resolvedTopics.length}个质疑不再出现`);
+  }
+  if (parts.length === 0) {
+    parts.push('情绪和质疑分布基本稳定，无明显变化');
+  }
+  return parts.join('，') + '。';
+}
+
+function getEscalationLevel(result) {
+  const ea = result.emotionAnalysis;
+  const angerRatio = ea.percentages.anger || 0;
+  const worryRatio = ea.percentages.worry || 0;
+  const unaddressed = (result.topics || []).filter(t => !t.addressed).length;
+  const trendRising = result.trend && result.trend.risingEmotions && result.trend.risingEmotions.length > 0;
+
+  if (angerRatio >= 40 || (angerRatio >= 30 && trendRising)) return '🔴';
+  if (angerRatio >= 30 || worryRatio >= 30 || (trendRising && unaddressed >= 3)) return '🟡';
+  return '🟢';
+}
+
+function buildHandoverPackage(batchResult, configPath) {
+  const dir = batchResult.outputDir;
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const ts = timestampForFile();
+
+  if (configPath) {
+    const configCopyPath = path.join(dir, `原始配置_${ts}.txt`);
+    fs.copyFileSync(path.resolve(configPath), configCopyPath);
+  }
+
+  const manifestLines = [];
+  manifestLines.push(`交班包目录清单 - ${now}`);
+  manifestLines.push(`CrisisPulse v1.3 自动生成`);
+  manifestLines.push('');
+  manifestLines.push('=== 文件清单 ===');
+  const allFiles = fs.readdirSync(dir).sort();
+  for (const f of allFiles) {
+    const stat = fs.statSync(path.join(dir, f));
+    manifestLines.push(`  ${f}  (${stat.size} 字节)`);
+  }
+  manifestLines.push('');
+  manifestLines.push('=== 事件状态 ===');
+  for (const r of batchResult.results) {
+    const level = getEscalationLevel(r.result);
+    const s = r.result.summary;
+    manifestLines.push(`  ${level} ${r.event} | ${s.topEmotionLabel}${s.topEmotionRatio}% | ${s.unaddressedCount}项未回应 | ${s.trendSummary}`);
+  }
+  if (batchResult.errors.length > 0) {
+    manifestLines.push('');
+    manifestLines.push('=== 失败事件 ===');
+    for (const e of batchResult.errors) {
+      manifestLines.push(`  ✗ ${e.event}: ${e.error}`);
+    }
+  }
+  manifestLines.push('');
+  manifestLines.push('=== 图例 ===');
+  manifestLines.push('  🔴 需升级响应（愤怒>40%或愤怒>30%且升温）');
+  manifestLines.push('  🟡 需重点关注（愤怒>30%或担忧>30%或升温且未回应≥3）');
+  manifestLines.push('  🟢 常规监测');
+
+  const manifestPath = path.join(dir, `交班包清单_${ts}.txt`);
+  fs.writeFileSync(manifestPath, manifestLines.join('\n'), 'utf-8');
+
+  const handoverSummary = [];
+  handoverSummary.push('═'.repeat(60));
+  handoverSummary.push(`  📋 交班摘要 ${now}`);
+  handoverSummary.push('═'.repeat(60));
+  handoverSummary.push('');
+  for (const r of batchResult.results) {
+    const level = getEscalationLevel(r.result);
+    const s = r.result.summary;
+    handoverSummary.push(`  ${level} ${r.event}`);
+    handoverSummary.push(`     评论${r.result.commentCount}条 | ${s.topEmotionLabel}${s.topEmotionRatio}% | ${s.unaddressedCount}项未回应`);
+    handoverSummary.push(`     优先: ${s.firstPriority.substring(0, 50)}`);
+    handoverSummary.push(`     趋势: ${s.trendSummary.substring(0, 60)}`);
+    handoverSummary.push('');
+  }
+  const escalateCount = batchResult.results.filter(r => getEscalationLevel(r.result) === '🔴').length;
+  const watchCount = batchResult.results.filter(r => getEscalationLevel(r.result) === '🟡').length;
+  const okCount = batchResult.results.filter(r => getEscalationLevel(r.result) === '🟢').length;
+  handoverSummary.push('─'.repeat(60));
+  handoverSummary.push(`  合计: 🔴${escalateCount}个需升级  🟡${watchCount}个需关注  🟢${okCount}个常规`);
+  handoverSummary.push('═'.repeat(60));
+  handoverSummary.push(`  文件目录: ${dir}`);
+  handoverSummary.push(`  交班包清单: ${path.basename(manifestPath)}`);
+  handoverSummary.push('═'.repeat(60));
+
+  return {
+    manifestPath,
+    manifestContent: manifestLines.join('\n'),
+    handoverSummary: handoverSummary.join('\n'),
+    escalationStats: { escalateCount, watchCount, okCount }
+  };
+}
+
 function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
   const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
   const { comments: rawComments, fileStats } = parseFiles(paths);
@@ -762,7 +985,7 @@ function generateBatchSummary(batchResult) {
   }
 
   lines.push(DOUBLE);
-  lines.push(`  *由 CrisisPulse v1.2 于 ${now} 批量生成*`);
+  lines.push(`  *由 CrisisPulse v1.3 于 ${now} 批量生成*`);
   lines.push(DOUBLE);
 
   return lines.join('\n');
@@ -824,7 +1047,7 @@ function generateBatchMarkdown(batchResult) {
   }
 
   lines.push('---');
-  lines.push(`*由 CrisisPulse v1.2 于 ${now} 批量生成*`);
+  lines.push(`*由 CrisisPulse v1.3 于 ${now} 批量生成*`);
 
   return lines.join('\n');
 }
@@ -863,11 +1086,16 @@ module.exports = {
   generateDoubts,
   generatePriority,
   runAnalysis,
+  compareAnalysis,
+  getEscalationLevel,
+  buildHandoverPackage,
   parseBatchConfig,
   runBatchAnalysis,
   generateBatchSummary,
   generateBatchMarkdown,
   exportBatchReport,
+  parseTaggedFact,
+  FACT_TAGS,
   EMOTION_CATEGORIES,
   TOPIC_PATTERNS
 };
