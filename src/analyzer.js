@@ -847,6 +847,364 @@ function buildHandoverPackage(batchResult, configPath) {
   };
 }
 
+function parseHandoverManifest(manifestPath) {
+  const content = fs.readFileSync(path.resolve(manifestPath), 'utf-8');
+  const lines = content.split('\n');
+  const events = [];
+  const files = [];
+  let section = '';
+
+  for (const line of lines) {
+    if (line.startsWith('=== 文件清单 ===')) {
+      section = 'files';
+      continue;
+    }
+    if (line.startsWith('=== 事件状态 ===')) {
+      section = 'events';
+      continue;
+    }
+    if (line.startsWith('=== 失败事件 ===')) {
+      section = 'errors';
+      continue;
+    }
+    if (line.startsWith('=== 图例 ===')) {
+      section = '';
+      continue;
+    }
+    if (line.startsWith('=== ')) {
+      section = '';
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (section === 'files') {
+      const match = trimmed.match(/^(.+?)\s+\((\d+)\s+字节\)$/);
+      if (match) {
+        files.push({ filename: match[1].trim(), size: parseInt(match[2], 10) });
+      }
+    }
+
+    if (section === 'events') {
+      const match = trimmed.match(/^(🔴|🟡|🟢)\s+(.+?)\s*\|\s*(\S+?)(\d+)%\s*\|\s*(\d+)项未回应\s*\|\s*(.+)$/);
+      if (match) {
+        events.push({
+          level: match[1],
+          event: match[2].trim(),
+          topEmotionLabel: match[3],
+          topEmotionRatio: parseInt(match[4], 10),
+          unaddressedCount: parseInt(match[5], 10),
+          trendSummary: match[6].trim()
+        });
+      }
+    }
+  }
+
+  return { events, files, manifestPath, manifestDir: path.dirname(path.resolve(manifestPath)) };
+}
+
+function generateHandoverConfirmation(receiveResult) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const ts = timestampForFile();
+  const lines = [];
+
+  lines.push('═'.repeat(60));
+  lines.push(`  ✅ 接班确认摘要 ${now}`);
+  lines.push('═'.repeat(60));
+  lines.push('');
+  lines.push(`  交班包: ${receiveResult.manifestPath}`);
+  lines.push(`  接收人: ${receiveResult.receiver || '未署名'}`);
+  lines.push('');
+
+  const byStatus = { received: [], followup: [], escalated: [] };
+  for (const e of receiveResult.events) {
+    byStatus[e.status || 'received'].push(e);
+  }
+
+  if (byStatus.received.length > 0) {
+    lines.push('  📥 已接收（已清晰，无需特殊处理）');
+    lines.push('─'.repeat(60));
+    for (const e of byStatus.received) {
+      lines.push(`  ✓ ${e.level} ${e.event}`);
+      if (e.note) lines.push(`     备注: ${e.note}`);
+    }
+    lines.push('');
+  }
+
+  if (byStatus.followup.length > 0) {
+    lines.push('  📌 需跟进（需重点关注或持续跟进）');
+    lines.push('─'.repeat(60));
+    for (const e of byStatus.followup) {
+      lines.push(`  ★ ${e.level} ${e.event}`);
+      lines.push(`     最高情绪: ${e.topEmotionLabel}${e.topEmotionRatio}% | 未回应: ${e.unaddressedCount}项`);
+      lines.push(`     趋势: ${e.trendSummary.substring(0, 50)}`);
+      if (e.note) lines.push(`     跟进计划: ${e.note}`);
+    }
+    lines.push('');
+  }
+
+  if (byStatus.escalated.length > 0) {
+    lines.push('  🚨 已升级（需升级响应或上报）');
+    lines.push('─'.repeat(60));
+    for (const e of byStatus.escalated) {
+      lines.push(`  ⚠ ${e.level} ${e.event}`);
+      lines.push(`     最高情绪: ${e.topEmotionLabel}${e.topEmotionRatio}% | 未回应: ${e.unaddressedCount}项`);
+      lines.push(`     趋势: ${e.trendSummary.substring(0, 50)}`);
+      if (e.note) lines.push(`     升级处理: ${e.note}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('═'.repeat(60));
+  lines.push(`  合计: 📥${byStatus.received.length}个已接收  📌${byStatus.followup.length}个需跟进  🚨${byStatus.escalated.length}个已升级`);
+  lines.push('═'.repeat(60));
+
+  const mdLines = [];
+  mdLines.push(`# 接班确认摘要`);
+  mdLines.push('');
+  mdLines.push(`> ${now} | 交班包: ${path.basename(receiveResult.manifestPath)}`);
+  mdLines.push('');
+  if (byStatus.received.length > 0) {
+    mdLines.push('## 📥 已接收');
+    mdLines.push('');
+    for (const e of byStatus.received) {
+      mdLines.push(`- ${e.level} **${e.event}**${e.note ? ` - ${e.note}` : ''}`);
+    }
+    mdLines.push('');
+  }
+  if (byStatus.followup.length > 0) {
+    mdLines.push('## 📌 需跟进');
+    mdLines.push('');
+    for (const e of byStatus.followup) {
+      mdLines.push(`- ${e.level} **${e.event}**`);
+      mdLines.push(`  - 情绪: ${e.topEmotionLabel}${e.topEmotionRatio}% | 未回应: ${e.unaddressedCount}项`);
+      mdLines.push(`  - 趋势: ${e.trendSummary}`);
+      if (e.note) mdLines.push(`  - 跟进: ${e.note}`);
+    }
+    mdLines.push('');
+  }
+  if (byStatus.escalated.length > 0) {
+    mdLines.push('## 🚨 已升级');
+    mdLines.push('');
+    for (const e of byStatus.escalated) {
+      mdLines.push(`- ${e.level} **${e.event}**`);
+      mdLines.push(`  - 情绪: ${e.topEmotionLabel}${e.topEmotionRatio}% | 未回应: ${e.unaddressedCount}项`);
+      mdLines.push(`  - 趋势: ${e.trendSummary}`);
+      if (e.note) mdLines.push(`  - 升级: ${e.note}`);
+    }
+    mdLines.push('');
+  }
+  mdLines.push('---');
+  mdLines.push(`*由 CrisisPulse 于 ${now} 生成*`);
+
+  return {
+    text: lines.join('\n'),
+    markdown: mdLines.join('\n'),
+    timestamp: ts,
+    stats: {
+      received: byStatus.received.length,
+      followup: byStatus.followup.length,
+      escalated: byStatus.escalated.length
+    }
+  };
+}
+
+function runMultiTimeCompare(eventName, fileGroups, labels) {
+  const results = [];
+  for (let i = 0; i < fileGroups.length; i++) {
+    const r = runAnalysis(eventName, '', fileGroups[i], []);
+    results.push({
+      label: labels[i] || `时段${i + 1}`,
+      result: r
+    });
+  }
+
+  const timeline = [];
+  for (let i = 0; i < results.length - 1; i++) {
+    const compare = compareAnalysis(results[i].result, results[i + 1].result);
+    timeline.push({
+      fromLabel: results[i].label,
+      toLabel: results[i + 1].label,
+      compare
+    });
+  }
+
+  const emotionsByTime = [];
+  for (const r of results) {
+    emotionsByTime.push({
+      label: r.label,
+      anger: r.result.emotionAnalysis.percentages.anger,
+      worry: r.result.emotionAnalysis.percentages.worry,
+      verify: r.result.emotionAnalysis.percentages.verify,
+      onlook: r.result.emotionAnalysis.percentages.onlook,
+      commentCount: r.result.commentCount
+    });
+  }
+
+  const topicHeatByTime = {};
+  for (const r of results) {
+    for (const t of r.result.topics) {
+      if (!topicHeatByTime[t.id]) {
+        topicHeatByTime[t.id] = { question: t.question, heat: {} };
+      }
+      topicHeatByTime[t.id].heat[r.label] = t.hits.length;
+    }
+  }
+
+  const risingTopics = [];
+  for (const [tid, data] of Object.entries(topicHeatByTime)) {
+    let maxHeat = 0;
+    let maxLabel = '';
+    let prevHeat = 0;
+    for (const r of results) {
+      const h = data.heat[r.label] || 0;
+      if (h > maxHeat) {
+        maxHeat = h;
+        maxLabel = r.label;
+      }
+      prevHeat = h;
+    }
+    const heats = results.map(r => data.heat[r.label] || 0);
+    const firstHeat = heats[0] || 0;
+    const lastHeat = heats[heats.length - 1] || 0;
+    if (lastHeat > firstHeat * 1.2 && lastHeat >= 2) {
+      risingTopics.push({
+        question: data.question,
+        firstHeat,
+        lastHeat,
+        peakLabel: maxLabel,
+        peakHeat: maxHeat,
+        heats
+      });
+    }
+  }
+  risingTopics.sort((a, b) => b.lastHeat - a.lastHeat);
+
+  const risingEmotions = [];
+  for (const emo of ['anger', 'worry', 'verify', 'onlook']) {
+    const emoValues = emotionsByTime.map(e => e[emo]);
+    const first = emoValues[0] || 0;
+    const last = emoValues[emoValues.length - 1] || 0;
+    if (last > first + 5) {
+      risingEmotions.push({
+        emotion: emo,
+        label: EMOTION_CATEGORIES[emo].label,
+        first,
+        last,
+        diff: last - first,
+        values: emoValues
+      });
+    }
+  }
+
+  return {
+    results,
+    timeline,
+    emotionsByTime,
+    topicHeatByTime,
+    risingTopics,
+    risingEmotions,
+    summary: buildMultiTimeSummary(emotionsByTime, risingTopics, risingEmotions, results)
+  };
+}
+
+function buildMultiTimeSummary(emotionsByTime, risingTopics, risingEmotions, results) {
+  const parts = [];
+  if (risingEmotions.length > 0) {
+    parts.push(risingEmotions.map(e => `${e.label}(+${e.diff}%)`).join('、') + '持续升温');
+  }
+  if (risingTopics.length > 0) {
+    parts.push(`质疑升温: ${risingTopics.slice(0, 3).map(t => `"${t.question}"`).join('、')}`);
+  }
+  if (risingEmotions.length === 0 && risingTopics.length === 0) {
+    parts.push('情绪和质疑总体稳定');
+  }
+  const timeLabels = results.map(r => r.label).join(' → ');
+  return `[${timeLabels}] ${parts.join('，')}。`;
+}
+
+const FACT_STORE_DIR = path.join(process.cwd(), '.crisis_pulse_facts');
+
+function ensureFactStoreDir() {
+  if (!fs.existsSync(FACT_STORE_DIR)) {
+    fs.mkdirSync(FACT_STORE_DIR, { recursive: true });
+  }
+}
+
+function getFactStorePath(eventName) {
+  ensureFactStoreDir();
+  const safeName = eventName.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_');
+  return path.join(FACT_STORE_DIR, `${safeName}.json`);
+}
+
+function loadFactStore(eventName) {
+  const storePath = getFactStorePath(eventName);
+  if (!fs.existsSync(storePath)) {
+    return { eventName, facts: [], updatedAt: null };
+  }
+  try {
+    const content = fs.readFileSync(storePath, 'utf-8');
+    return JSON.parse(content);
+  } catch (e) {
+    return { eventName, facts: [], updatedAt: null, error: e.message };
+  }
+}
+
+function saveFactStore(eventName, facts) {
+  const storePath = getFactStorePath(eventName);
+  const data = {
+    eventName,
+    facts: facts.map(f => ({
+      text: typeof f === 'string' ? f : f.text,
+      tag: typeof f === 'string' ? '' : (f.tag || ''),
+      createdAt: typeof f === 'string' ? new Date().toISOString() : (f.createdAt || new Date().toISOString())
+    })),
+    updatedAt: new Date().toISOString()
+  };
+  fs.writeFileSync(storePath, JSON.stringify(data, null, 2), 'utf-8');
+  return data;
+}
+
+function mergeFactsWithHistory(currentFacts, historyStore) {
+  const historyFacts = historyStore.facts || [];
+  const currentTexts = new Set(currentFacts.map(f => typeof f === 'string' ? f : f.text));
+  const historyTexts = new Set(historyFacts.map(f => f.text));
+
+  const merged = [];
+  for (const f of currentFacts) {
+    const text = typeof f === 'string' ? f : f.text;
+    const tag = typeof f === 'string' ? '' : (f.tag || '');
+    const source = historyTexts.has(text) ? 'history' : 'new';
+    merged.push({ text, tag, source });
+  }
+  for (const f of historyFacts) {
+    if (!currentTexts.has(f.text)) {
+      merged.push({ text: f.text, tag: f.tag || '', source: 'history' });
+    }
+  }
+  return merged;
+}
+
+function listFactStores() {
+  ensureFactStoreDir();
+  const files = fs.readdirSync(FACT_STORE_DIR).filter(f => f.endsWith('.json'));
+  const stores = [];
+  for (const f of files) {
+    try {
+      const content = fs.readFileSync(path.join(FACT_STORE_DIR, f), 'utf-8');
+      const data = JSON.parse(content);
+      stores.push({
+        filename: f,
+        eventName: data.eventName,
+        factCount: (data.facts || []).length,
+        updatedAt: data.updatedAt
+      });
+    } catch (e) {}
+  }
+  return stores;
+}
+
 function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
   const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
   const { comments: rawComments, fileStats } = parseFiles(paths);
@@ -1087,15 +1445,24 @@ module.exports = {
   generatePriority,
   runAnalysis,
   compareAnalysis,
+  runMultiTimeCompare,
   getEscalationLevel,
   buildHandoverPackage,
+  parseHandoverManifest,
+  generateHandoverConfirmation,
   parseBatchConfig,
   runBatchAnalysis,
   generateBatchSummary,
   generateBatchMarkdown,
   exportBatchReport,
   parseTaggedFact,
+  loadFactStore,
+  saveFactStore,
+  mergeFactsWithHistory,
+  listFactStores,
+  getFactStorePath,
   FACT_TAGS,
+  FACT_STORE_DIR,
   EMOTION_CATEGORIES,
   TOPIC_PATTERNS
 };

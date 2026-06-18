@@ -15,13 +15,21 @@ const {
   analyzeTrend,
   runAnalysis,
   compareAnalysis,
+  runMultiTimeCompare,
   getEscalationLevel,
   buildHandoverPackage,
+  parseHandoverManifest,
+  generateHandoverConfirmation,
   parseBatchConfig,
   runBatchAnalysis,
   generateBatchSummary,
   exportBatchReport,
   parseTaggedFact,
+  loadFactStore,
+  saveFactStore,
+  mergeFactsWithHistory,
+  listFactStores,
+  getFactStorePath,
   FACT_TAGS
 } = require('../src/analyzer');
 const {
@@ -34,6 +42,8 @@ const {
   formatMarkdownPriority,
   formatCompareReport,
   formatCompareMarkdown,
+  formatMultiTimeCompare,
+  formatMultiTimeMarkdown,
   exportReport,
   sanitizeFilename,
   timestampForFile
@@ -506,6 +516,132 @@ function testFormatCompareReport() {
   assert(md.includes('复盘对比'), `md报告应含复盘对比`);
 }
 
+function testMarkdownTaggedFacts() {
+  console.log('\n[formatMarkdown tagged facts]');
+  const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
+  const taggedFacts = [
+    { text: '伤亡数字已核实为5人', tag: '伤亡数据' },
+    { text: '已公布通报进展', tag: '通报进展' }
+  ];
+  const result = runAnalysis('测试事故', '', f1, taggedFacts);
+  const md = formatMarkdown(result, 'full');
+  assert(md.includes('## 附：已录入补充事实'), `md应有补充事实附录`);
+  assert(md.includes('### ✓ 伤亡数据'), `md应按标签分组显示`);
+  assert(md.includes('### ✓ 通报进展'), `md应显示所有标签组`);
+  assert(md.includes('伤亡数字已核实为5人'), `md应显示事实文本而非对象`);
+  assert(!md.includes('[object Object]'), `md不应显示对象占位符`);
+  assert(md.includes('标签覆盖情况'), `md应显示标签覆盖情况`);
+}
+
+function testParseHandoverManifest() {
+  console.log('\n[parseHandoverManifest]');
+  const events = [
+    { name: '事件A', timeRange: '', filePaths: [path.join(__dirname, '..', 'samples', 'crisis_comments.txt')] }
+  ];
+  const tmpDir = path.join(__dirname, '..', 'tmp_manifest_test');
+  try {
+    const batchResult = runBatchAnalysis(events, tmpDir);
+    const pkg = buildHandoverPackage(batchResult, path.join(__dirname, '..', 'samples', 'batch_config.txt'));
+    const parsed = parseHandoverManifest(pkg.manifestPath);
+    assert(parsed.events.length > 0, `应解析到事件`);
+    assert(parsed.files.length > 0, `应解析到文件清单`);
+    assert(parsed.events[0].level === '🔴' || parsed.events[0].level === '🟡' || parsed.events[0].level === '🟢', `事件应有级别标记`);
+    assert(parsed.events[0].event === '事件A', `事件名称应正确`);
+    assert(typeof parsed.events[0].unaddressedCount === 'number', `应有未回应计数`);
+
+    for (const r of batchResult.results) {
+      for (const f of r.files) try { fs.unlinkSync(f.path); } catch (_) {}
+    }
+    try { fs.unlinkSync(pkg.manifestPath); } catch (_) {}
+    const files = fs.readdirSync(tmpDir);
+    for (const f of files) try { fs.unlinkSync(path.join(tmpDir, f)); } catch (_) {}
+    try { fs.rmdirSync(tmpDir); } catch (_) {}
+  } catch (e) {
+    assert(false, `清单解析异常: ${e.message}`);
+    try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+  }
+}
+
+function testGenerateHandoverConfirmation() {
+  console.log('\n[generateHandoverConfirmation]');
+  const receiveResult = {
+    manifestPath: '/test/清单.txt',
+    receiver: '张三',
+    events: [
+      { level: '🟢', event: '常规事件', status: 'received', topEmotionLabel: '围观', topEmotionRatio: 60, unaddressedCount: 2, trendSummary: '无明显升温', note: '已确认' },
+      { level: '🟡', event: '关注事件', status: 'followup', topEmotionLabel: '担忧', topEmotionRatio: 35, unaddressedCount: 5, trendSummary: '缓慢升温', note: '下午跟进' },
+      { level: '🔴', event: '紧急事件', status: 'escalated', topEmotionLabel: '愤怒', topEmotionRatio: 45, unaddressedCount: 8, trendSummary: '快速升温', note: '已上报领导' }
+    ]
+  };
+  const confirm = generateHandoverConfirmation(receiveResult);
+  assert(confirm.text.includes('接班确认摘要'), `应有接班确认标题`);
+  assert(confirm.text.includes('张三'), `应显示接收人`);
+  assert(confirm.text.includes('📥1个已接收'), `应统计已接收`);
+  assert(confirm.text.includes('📌1个需跟进'), `应统计需跟进`);
+  assert(confirm.text.includes('🚨1个已升级'), `应统计已升级`);
+  assert(confirm.stats.received === 1, `已接收统计正确`);
+  assert(confirm.stats.followup === 1, `需跟进统计正确`);
+  assert(confirm.stats.escalated === 1, `已升级统计正确`);
+  assert(confirm.markdown.includes('# 接班确认摘要'), `md版应有标题`);
+  assert(confirm.markdown.includes('## 📥 已接收'), `md版应分组`);
+  assert(confirm.markdown.includes('## 📌 需跟进'), `md版应分组`);
+  assert(confirm.markdown.includes('## 🚨 已升级'), `md版应分组`);
+}
+
+function testRunMultiTimeCompare() {
+  console.log('\n[runMultiTimeCompare]');
+  const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
+  const f2 = path.join(__dirname, '..', 'samples', 'weibo_comments.txt');
+  const result = runMultiTimeCompare('测试事故', [[f1], [f1, f2]], ['昨日', '今日']);
+  assert(result.results.length === 2, `应返回2个时段结果`);
+  assert(result.emotionsByTime.length === 2, `应返回2个时段情绪数据`);
+  assert(result.summary && result.summary.length > 0, `应有汇总摘要`);
+  assert(result.timeline.length === 1, `应有1段相邻对比`);
+  assert(result.emotionsByTime[0].label === '昨日', `时段标签正确`);
+  assert(result.emotionsByTime[1].label === '今日', `时段标签正确`);
+  assert(Array.isArray(result.risingEmotions), `应有risingEmotions数组`);
+  assert(Array.isArray(result.risingTopics), `应有risingTopics数组`);
+}
+
+function testFactStore() {
+  console.log('\n[fact store]');
+  const testEvent = '__test_event__';
+  const storePath = getFactStorePath(testEvent);
+  try {
+    const store0 = loadFactStore(testEvent);
+    assert(store0.facts.length === 0, `新建事件事实库应为空`);
+
+    const facts = [
+      { text: '伤亡5人', tag: '伤亡数据' },
+      { text: '通报已发', tag: '通报进展' }
+    ];
+    const saved = saveFactStore(testEvent, facts);
+    assert(saved.facts.length === 2, `保存后应有2条事实`);
+    assert(fs.existsSync(storePath), `应生成事实库文件`);
+
+    const loaded = loadFactStore(testEvent);
+    assert(loaded.facts.length === 2, `加载后应有2条事实`);
+    assert(loaded.facts[0].text === '伤亡5人', `事实文本应正确`);
+    assert(loaded.facts[0].tag === '伤亡数据', `事实标签应正确`);
+
+    const current = [{ text: '新增事实', tag: '善后赔偿' }];
+    const merged = mergeFactsWithHistory(current, loaded);
+    assert(merged.length === 3, `合并后应有3条事实`);
+    const newCount = merged.filter(f => f.source === 'new').length;
+    const historyCount = merged.filter(f => f.source === 'history').length;
+    assert(newCount === 1, `应有1条新增`);
+    assert(historyCount === 2, `应有2条历史`);
+
+    const stores = listFactStores();
+    assert(stores.length >= 1, `应能列出事实库`);
+
+    fs.unlinkSync(storePath);
+  } catch (e) {
+    assert(false, `事实库异常: ${e.message}`);
+    try { if (fs.existsSync(storePath)) fs.unlinkSync(storePath); } catch (_) {}
+  }
+}
+
 function testBriefUpdateWithTrend() {
   console.log('\n[formatBriefUpdate trend]');
   const f1 = path.join(__dirname, '..', 'samples', 'crisis_comments.txt');
@@ -545,6 +681,11 @@ testCompareAnalysis();
 testEscalationLevel();
 testHandoverPackage();
 testFormatCompareReport();
+testMarkdownTaggedFacts();
+testParseHandoverManifest();
+testGenerateHandoverConfirmation();
+testRunMultiTimeCompare();
+testFactStore();
 
 console.log('\n' + '═'.repeat(40));
 console.log(`  通过: ${passed}  失败: ${failed}`);

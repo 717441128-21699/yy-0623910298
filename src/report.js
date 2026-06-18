@@ -108,17 +108,27 @@ function formatReport(result, mode) {
     const facts = result.supplementaryFacts;
     const tagged = facts.filter(f => typeof f !== 'string' && f.tag);
     const untagged = facts.filter(f => typeof f === 'string' || !f.tag);
+
+    const coveredTagSet = new Set();
+    for (const t of (result.topics || [])) {
+      if (t.addressed && t.matchingTags) {
+        for (const tag of t.matchingTags) coveredTagSet.add(tag);
+      }
+    }
+
     if (tagged.length > 0) {
       const groups = {};
       for (const f of tagged) {
         const tag = f.tag || '未分类';
         if (!groups[tag]) groups[tag] = [];
-        groups[tag].push(f.text);
+        groups[tag].push(f);
       }
       for (const [tag, items] of Object.entries(groups)) {
-        lines.push(`  [${tag}]`);
-        for (const item of items) {
-          lines.push(`    · ${item}`);
+        const status = coveredTagSet.has(tag) ? '✓' : '✗';
+        lines.push(`  ${status} [${tag}]`);
+        for (const f of items) {
+          const marker = f.source === 'new' ? ' 🆕' : (f.source === 'history' ? ' 📜' : '');
+          lines.push(`    · ${f.text}${marker}`);
         }
       }
     }
@@ -126,14 +136,37 @@ function formatReport(result, mode) {
       lines.push(`  [未标签]`);
       for (const f of untagged) {
         const text = typeof f === 'string' ? f : f.text;
-        lines.push(`    · ${text}`);
+        const marker = f.source === 'new' ? ' 🆕' : (f.source === 'history' ? ' 📜' : '');
+        lines.push(`    · ${text}${marker}`);
+      }
+    }
+
+    if (coveredTagSet.size > 0) {
+      lines.push('');
+      lines.push('  标签覆盖情况:');
+      for (const tag of coveredTagSet) {
+        const relatedTopics = [];
+        for (const t of (result.topics || [])) {
+          if (t.addressed && t.matchingTags && t.matchingTags.includes(tag)) {
+            relatedTopics.push(t.question);
+          }
+        }
+        if (relatedTopics.length > 0) {
+          lines.push(`    ✓ ${tag}: 已覆盖 ${relatedTopics.join('、')}`);
+        }
+      }
+      const allTags = new Set();
+      for (const f of tagged) allTags.add(f.tag);
+      const uncoveredTags = Array.from(allTags).filter(t => !coveredTagSet.has(t));
+      for (const tag of uncoveredTags) {
+        lines.push(`    ✗ ${tag}: 暂未覆盖主要质疑`);
       }
     }
     lines.push('');
   }
 
   lines.push(DOUBLE_DIVIDER);
-  lines.push('  命令: /facts 查看  /tag #标签 内容  /diff 对比  /save 导出  /quit 退出  /help 帮助');
+  lines.push('  命令: /facts 查看  /tag #标签  /multidiff 多时段  /loadfacts 加载  /save 导出  /quit 退出  /help 帮助');
   lines.push(DOUBLE_DIVIDER);
 
   return lines.join('\n');
@@ -327,10 +360,68 @@ function formatMarkdown(result, mode) {
   if (result.supplementaryFacts && result.supplementaryFacts.length > 0) {
     lines.push('## 附：已录入补充事实');
     lines.push('');
-    for (let i = 0; i < result.supplementaryFacts.length; i++) {
-      lines.push(`${i + 1}. ${result.supplementaryFacts[i]}`);
+    const facts = result.supplementaryFacts;
+    const tagged = facts.filter(f => typeof f !== 'string' && f.tag);
+    const untagged = facts.filter(f => typeof f === 'string' || !f.tag);
+
+    const { TOPIC_PATTERNS, FACT_TAGS } = require('./analyzer');
+    const coveredTagSet = new Set();
+    for (const t of (result.topics || [])) {
+      if (t.addressed && t.matchingTags) {
+        for (const tag of t.matchingTags) coveredTagSet.add(tag);
+      }
     }
-    lines.push('');
+
+    if (tagged.length > 0) {
+      const groups = {};
+      for (const f of tagged) {
+        const tag = f.tag || '未分类';
+        if (!groups[tag]) groups[tag] = [];
+        groups[tag].push(f);
+      }
+      for (const [tag, items] of Object.entries(groups)) {
+        const status = coveredTagSet.has(tag) ? '✓' : '✗';
+        lines.push(`### ${status} ${tag}`);
+        lines.push('');
+        for (const f of items) {
+          const marker = f.source === 'new' ? '🆕 ' : (f.source === 'history' ? '📜 ' : '');
+          lines.push(`- ${marker}${f.text}`);
+        }
+        lines.push('');
+      }
+    }
+    if (untagged.length > 0) {
+      lines.push('### 未标签');
+      lines.push('');
+      for (const f of untagged) {
+        const text = typeof f === 'string' ? f : f.text;
+        lines.push(`- ${text}`);
+      }
+      lines.push('');
+    }
+
+    if (coveredTagSet.size > 0) {
+      lines.push('### 标签覆盖情况');
+      lines.push('');
+      for (const tag of coveredTagSet) {
+        const relatedTopics = [];
+        for (const t of (result.topics || [])) {
+          if (t.addressed && t.matchingTags && t.matchingTags.includes(tag)) {
+            relatedTopics.push(t.question);
+          }
+        }
+        if (relatedTopics.length > 0) {
+          lines.push(`- ✅ **${tag}**: 已覆盖 ${relatedTopics.join('、')}`);
+        }
+      }
+      const allTags = new Set();
+      for (const f of tagged) allTags.add(f.tag);
+      const uncoveredTags = Array.from(allTags).filter(t => !coveredTagSet.has(t));
+      for (const tag of uncoveredTags) {
+        lines.push(`- ⏳ **${tag}**: 暂未覆盖主要质疑`);
+      }
+      lines.push('');
+    }
   }
 
   lines.push('---');
@@ -509,6 +600,123 @@ function formatCompareMarkdown(compareResult, eventName) {
   return lines.join('\n');
 }
 
+function formatMultiTimeCompare(multiResult, eventName) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+
+  lines.push(DOUBLE_DIVIDER);
+  lines.push(`  多时段复盘 · ${eventName || '事件'}`);
+  lines.push(`  ${now}`);
+  lines.push(DOUBLE_DIVIDER);
+  lines.push('');
+  lines.push(`  ${multiResult.summary}`);
+  lines.push('');
+
+  lines.push(DIVIDER);
+  lines.push('  情绪变化时间线');
+  lines.push(DIVIDER);
+  const labels = multiResult.emotionsByTime.map(e => e.label);
+  const maxLabelLen = Math.max(...labels.map(l => l.length));
+  lines.push(`  ${'时段'.padEnd(maxLabelLen + 2)} | 愤怒 | 担忧 | 求证 | 围观 | 评论数`);
+  lines.push(`  ${'─'.repeat(maxLabelLen + 2)}─┼──────┼──────┼──────┼──────┼────────`);
+  for (const e of multiResult.emotionsByTime) {
+    lines.push(`  ${e.label.padEnd(maxLabelLen + 2)} | ${String(e.anger).padStart(3)}% | ${String(e.worry).padStart(3)}% | ${String(e.verify).padStart(3)}% | ${String(e.onlook).padStart(3)}% | ${String(e.commentCount).padStart(5)}条`);
+  }
+  lines.push('');
+
+  if (multiResult.risingEmotions.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  持续升温情绪');
+    lines.push(DIVIDER);
+    for (const e of multiResult.risingEmotions) {
+      const trend = e.values.map(v => `${v}%`).join(' → ');
+      lines.push(`  ↑ ${e.label}: ${trend} (+${e.diff}%)`);
+    }
+    lines.push('');
+  }
+
+  if (multiResult.risingTopics.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  持续升温质疑');
+    lines.push(DIVIDER);
+    for (const t of multiResult.risingTopics.slice(0, 5)) {
+      const trend = t.heats.map(h => `${h}条`).join(' → ');
+      const peak = t.peakHeat > t.lastHeat ? ` (峰值 ${t.peakLabel} ${t.peakHeat}条)` : '';
+      lines.push(`  ↑ ${t.question}: ${trend}${peak}`);
+    }
+    lines.push('');
+  }
+
+  if (multiResult.timeline.length > 0) {
+    lines.push(DIVIDER);
+    lines.push('  相邻时段对比');
+    lines.push(DIVIDER);
+    for (const tl of multiResult.timeline) {
+      lines.push(`  ${tl.fromLabel} → ${tl.toLabel}:`);
+      lines.push(`    ${tl.compare.summary}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(DOUBLE_DIVIDER);
+  return lines.join('\n');
+}
+
+function formatMultiTimeMarkdown(multiResult, eventName) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+
+  lines.push(`# 多时段复盘 · ${eventName || '事件'}`);
+  lines.push('');
+  lines.push(`> ${now} | ${multiResult.summary}`);
+  lines.push('');
+
+  lines.push('## 情绪变化时间线');
+  lines.push('');
+  lines.push('| 时段 | 愤怒 | 担忧 | 求证 | 围观 | 评论数 |');
+  lines.push('| ---- | ---- | ---- | ---- | ---- | ------ |');
+  for (const e of multiResult.emotionsByTime) {
+    lines.push(`| ${e.label} | ${e.anger}% | ${e.worry}% | ${e.verify}% | ${e.onlook}% | ${e.commentCount}条 |`);
+  }
+  lines.push('');
+
+  if (multiResult.risingEmotions.length > 0) {
+    lines.push('## 持续升温情绪');
+    lines.push('');
+    for (const e of multiResult.risingEmotions) {
+      const trend = e.values.map(v => `${v}%`).join(' → ');
+      lines.push(`- **${e.label}**: ${trend} (+${e.diff}%)`);
+    }
+    lines.push('');
+  }
+
+  if (multiResult.risingTopics.length > 0) {
+    lines.push('## 持续升温质疑');
+    lines.push('');
+    for (const t of multiResult.risingTopics.slice(0, 5)) {
+      const trend = t.heats.map(h => `${h}条`).join(' → ');
+      const peak = t.peakHeat > t.lastHeat ? ` *(${t.peakLabel} 峰值 ${t.peakHeat}条)*` : '';
+      lines.push(`- **${t.question}**: ${trend}${peak}`);
+    }
+    lines.push('');
+  }
+
+  if (multiResult.timeline.length > 0) {
+    lines.push('## 相邻时段对比');
+    lines.push('');
+    for (const tl of multiResult.timeline) {
+      lines.push(`### ${tl.fromLabel} → ${tl.toLabel}`);
+      lines.push('');
+      lines.push(tl.compare.summary);
+      lines.push('');
+    }
+  }
+
+  lines.push('---');
+  lines.push(`*由 CrisisPulse 于 ${now} 生成*`);
+  return lines.join('\n');
+}
+
 function exportReport(result, format, outputDir, mode) {
   const fmt = (format || 'txt').toLowerCase();
   const exportMode = mode || 'full';
@@ -549,6 +757,8 @@ module.exports = {
   formatMarkdownPriority,
   formatCompareReport,
   formatCompareMarkdown,
+  formatMultiTimeCompare,
+  formatMultiTimeMarkdown,
   exportReport,
   timestampForFile,
   sanitizeFilename,

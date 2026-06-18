@@ -7,13 +7,20 @@ const fs = require('fs');
 const {
   runAnalysis,
   compareAnalysis,
+  runMultiTimeCompare,
   getEscalationLevel,
   buildHandoverPackage,
+  parseHandoverManifest,
+  generateHandoverConfirmation,
   parseBatchConfig,
   runBatchAnalysis,
   exportBatchReport,
   generateBatchSummary,
   parseTaggedFact,
+  loadFactStore,
+  saveFactStore,
+  mergeFactsWithHistory,
+  listFactStores,
   FACT_TAGS
 } = require('./analyzer');
 const {
@@ -21,6 +28,8 @@ const {
   formatBriefUpdate,
   formatCompareReport,
   formatCompareMarkdown,
+  formatMultiTimeCompare,
+  formatMultiTimeMarkdown,
   exportReport
 } = require('./report');
 
@@ -319,6 +328,193 @@ async function runSingleMode() {
       continue;
     }
 
+    if (lower.startsWith('/multidiff') || lower.startsWith('/timediff')) {
+      const content = input.replace(/^\/(multidiff|timediff)\s+/i, '');
+      if (!content.trim()) {
+        console.log('  用法: /multidiff 时段1文件|时段2文件|时段3文件 --labels 早班,午间,晚间');
+        console.log('  例: /multidiff samples/early.txt|samples/mid.txt|samples/late.txt --labels 早班,午间,晚间');
+        continue;
+      }
+      let labels = [];
+      let filePart = content;
+      if (content.includes('--labels')) {
+        const idx = content.indexOf('--labels');
+        filePart = content.substring(0, idx).trim();
+        labels = content.substring(idx + 9).split(',').map(s => s.trim()).filter(Boolean);
+      }
+      const fileGroups = filePart.split('|').map(g => parseFilePaths(g.trim())).filter(g => g.length > 0);
+      if (fileGroups.length < 2) {
+        console.log('  请至少提供2组文件，用 | 分隔');
+        continue;
+      }
+      if (labels.length === 0) {
+        labels = fileGroups.map((_, i) => `时段${i + 1}`);
+      }
+      if (labels.length !== fileGroups.length) {
+        console.log(`  标签数量(${labels.length})与文件组数量(${fileGroups.length})不一致`);
+        continue;
+      }
+      try {
+        const multiResult = runMultiTimeCompare(eventName.trim(), fileGroups, labels);
+        console.log(formatMultiTimeCompare(multiResult, eventName.trim()));
+        const exportInput = await question('  是否导出多时段对比报告？(y/n，默认n): ');
+        if (exportInput.trim().toLowerCase() === 'y') {
+          const dirInput = await question('  保存目录 (留空为当前目录): ');
+          const dir = dirInput.trim() || process.cwd();
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+          const safeName = eventName.trim().replace(/[\\/:*?"<>|]/g, '_');
+          const txtPath = path.join(dir, `多时段对比_${safeName}_${ts}.txt`);
+          const mdPath = path.join(dir, `多时段对比_${safeName}_${ts}.md`);
+          fs.writeFileSync(txtPath, formatMultiTimeCompare(multiResult, eventName.trim()), 'utf-8');
+          fs.writeFileSync(mdPath, formatMultiTimeMarkdown(multiResult, eventName.trim()), 'utf-8');
+          console.log(`  ✓ 已导出: ${path.basename(txtPath)} / ${path.basename(mdPath)}`);
+        }
+      } catch (err) {
+        console.log(`  ✗ 多时段对比失败: ${err.message}`);
+      }
+      continue;
+    }
+
+    if (lower.startsWith('/receive') || lower.startsWith('/handover')) {
+      const manifestPath = input.replace(/^\/(receive|handover)\s+/i, '').trim();
+      if (!manifestPath) {
+        console.log('  用法: /receive 交班包清单文件路径');
+        continue;
+      }
+      try {
+        const manifest = parseHandoverManifest(manifestPath);
+        if (manifest.events.length === 0) {
+          console.log('  ✗ 未解析到事件，请检查清单文件格式');
+          continue;
+        }
+        console.log('');
+        console.log('═'.repeat(52));
+        console.log(`  📋 交班包接收 - 共 ${manifest.events.length} 个事件`);
+        console.log('═'.repeat(52));
+        console.log('  逐个标记状态: 1=已接收  2=需跟进  3=已升级  s=跳过  q=结束');
+        console.log('');
+
+        const receiveResult = {
+          manifestPath,
+          receiver: '',
+          events: []
+        };
+
+        for (let i = 0; i < manifest.events.length; i++) {
+          const e = manifest.events[i];
+          console.log(`  [${i + 1}/${manifest.events.length}] ${e.level} ${e.event}`);
+          console.log(`     情绪: ${e.topEmotionLabel}${e.topEmotionRatio}% | 未回应: ${e.unaddressedCount}项`);
+          console.log(`     趋势: ${e.trendSummary.substring(0, 60)}`);
+          const statusInput = await question('  > 状态 (1/2/3/s/q，默认1): ');
+          const trimmed = statusInput.trim().toLowerCase();
+          if (trimmed === 'q') break;
+          if (trimmed === 's') continue;
+
+          let status = 'received';
+          if (trimmed === '2') status = 'followup';
+          if (trimmed === '3') status = 'escalated';
+
+          const noteInput = await question('  > 备注 (可留空): ');
+          receiveResult.events.push({ ...e, status, note: noteInput.trim() || '' });
+          console.log('');
+        }
+
+        if (receiveResult.events.length === 0) {
+          console.log('  未标记任何事件，取消。');
+          continue;
+        }
+
+        const receiverInput = await question('  接收人姓名 (可留空): ');
+        receiveResult.receiver = receiverInput.trim();
+
+        const confirm = generateHandoverConfirmation(receiveResult);
+        console.log('');
+        console.log(confirm.text);
+
+        const saveConfirm = await question('  是否保存接班确认摘要？(y/n，默认y): ');
+        if (saveConfirm.trim().toLowerCase() !== 'n') {
+          const dirInput = await question('  保存目录 (留空为交班包目录): ');
+          const dir = dirInput.trim() || manifest.manifestDir;
+          const safeName = '接班确认';
+          const txtPath = path.join(dir, `接班确认_${confirm.timestamp}.txt`);
+          const mdPath = path.join(dir, `接班确认_${confirm.timestamp}.md`);
+          fs.writeFileSync(txtPath, confirm.text, 'utf-8');
+          fs.writeFileSync(mdPath, confirm.markdown, 'utf-8');
+          console.log(`  ✓ 已保存: ${path.basename(txtPath)} / ${path.basename(mdPath)}`);
+        }
+      } catch (err) {
+        console.log(`  ✗ 交班接收失败: ${err.message}`);
+      }
+      continue;
+    }
+
+    if (lower.startsWith('/listfacts')) {
+      const stores = listFactStores();
+      if (stores.length === 0) {
+        console.log('  (暂无已保存的事实库)');
+        continue;
+      }
+      console.log(`  已保存 ${stores.length} 个事件事实库:`);
+      for (let i = 0; i < stores.length; i++) {
+        const s = stores[i];
+        const time = s.updatedAt ? new Date(s.updatedAt).toLocaleString('zh-CN') : '未知';
+        console.log(`    ${i + 1}. ${s.eventName} (${s.factCount}条事实) - 更新于 ${time}`);
+      }
+      continue;
+    }
+
+    if (lower.startsWith('/loadfacts')) {
+      const nameInput = input.replace(/^\/loadfacts\s*/i, '').trim();
+      const loadName = nameInput || eventName.trim();
+      if (!loadName) {
+        console.log('  用法: /loadfacts 事件名称  (留空则加载当前事件)');
+        continue;
+      }
+      try {
+        const store = loadFactStore(loadName);
+        if ((store.facts || []).length === 0) {
+          console.log(`  (事件"${loadName}"暂无已保存的事实)`);
+          continue;
+        }
+        const merged = mergeFactsWithHistory(supplementaryFacts, store);
+        supplementaryFacts.length = 0;
+        for (const f of merged) supplementaryFacts.push(f);
+        const newCount = merged.filter(f => f.source === 'new').length;
+        const historyCount = merged.filter(f => f.source === 'history').length;
+        console.log(`  ✓ 已加载 ${store.facts.length} 条历史事实: 🆕 ${newCount}条新增 📜 ${historyCount}条沿用`);
+        try {
+          const updated = runAnalysis(eventName.trim(), timeRange.trim(), filePaths, supplementaryFacts);
+          result = updated;
+          console.log(formatBriefUpdate(updated));
+        } catch (err) {
+          console.log(`  警告: 重新分析失败: ${err.message}`);
+        }
+      } catch (err) {
+        console.log(`  ✗ 加载事实库失败: ${err.message}`);
+      }
+      continue;
+    }
+
+    if (lower.startsWith('/savefacts')) {
+      const nameInput = input.replace(/^\/savefacts\s*/i, '').trim();
+      const saveName = nameInput || eventName.trim();
+      if (!saveName) {
+        console.log('  用法: /savefacts 事件名称  (留空则保存当前事件)');
+        continue;
+      }
+      if (supplementaryFacts.length === 0) {
+        console.log('  （当前无事实可保存）');
+        continue;
+      }
+      try {
+        const saved = saveFactStore(saveName, supplementaryFacts);
+        console.log(`  ✓ 已保存 ${saved.facts.length} 条事实到事件"${saveName}"`);
+      } catch (err) {
+        console.log(`  ✗ 保存事实库失败: ${err.message}`);
+      }
+      continue;
+    }
+
     if (lower === '/undo' || lower === '/pop') {
       if (supplementaryFacts.length === 0) {
         console.log('  （事实列表为空，无法撤回）');
@@ -432,6 +628,12 @@ async function runSingleMode() {
       console.log('    /reset  /clear             清空所有补充事实');
       console.log('    /diff 前期文件路径         设置对比基准（如昨天的评论文件）');
       console.log('    /diff                      与当前结果对比（设置基准后）');
+      console.log('    /multidiff 文件1|文件2|... --labels 标签1,标签2,...');
+      console.log('                                多时段连续对比（早班/午间/晚间等）');
+      console.log('    /listfacts                 列出所有已保存的事实库');
+      console.log('    /loadfacts [事件名]        加载事件历史事实库');
+      console.log('    /savefacts [事件名]        保存当前事实到事件事实库');
+      console.log('    /receive 清单路径          交班包接收模式，逐个标记事件状态');
       console.log('    /save [txt|md] [full|brief|priority] [目录]');
       console.log('                                导出报告 (full完整, brief简版, priority仅建议)');
       console.log('    /batch                     切换到批量日报模式');
