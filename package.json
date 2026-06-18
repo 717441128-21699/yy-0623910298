@@ -1,0 +1,16 @@
+{
+  "name": "crisis-pulse",
+  "version": "1.0.0",
+  "description": "舆情危机快速分析命令行工具",
+  "main": "src/index.js",
+  "bin": {
+    "crisis-pulse": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run.js"
+  },
+  "keywords": ["crisis", "sentiment", "cli"],
+  "license": "MIT",
+  "dependencies": {}
+}
