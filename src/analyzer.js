@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { exportReport, timestampForFile } = require('./report');
 
 const EMOTION_CATEGORIES = {
   anger: {
@@ -488,6 +489,141 @@ function generatePriority(topics, emotionAnalysis, supplementaryFacts) {
   return lines;
 }
 
+function getBucketKey(timeMs, intervalHours) {
+  const d = new Date(timeMs);
+  if (intervalHours >= 24) {
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  }
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`;
+}
+
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+function determineInterval(comments) {
+  const timed = comments.filter(c => c.time);
+  if (timed.length < 2) return 24;
+  const times = timed.map(c => parseCommentTime(c.time)).filter(t => !isNaN(t)).sort((a, b) => a - b);
+  if (times.length < 2) return 24;
+  const spanHours = (times[times.length - 1] - times[0]) / (1000 * 60 * 60);
+  if (spanHours <= 36) return 1;
+  if (spanHours <= 14 * 24) return 6;
+  return 24;
+}
+
+function analyzeTrend(comments) {
+  const timed = comments.filter(c => c.time).map(c => ({
+    ...c,
+    timeMs: parseCommentTime(c.time)
+  })).filter(c => !isNaN(c.timeMs));
+
+  if (timed.length < 5) {
+    return { available: false, summary: '带时间戳的评论不足，无法判断趋势。' };
+  }
+
+  const intervalHours = determineInterval(timed);
+  const buckets = {};
+  for (const c of timed) {
+    const key = getBucketKey(c.timeMs, intervalHours);
+    if (!buckets[key]) {
+      buckets[key] = { key, counts: { anger: 0, worry: 0, verify: 0, onlook: 0 }, total: 0, topicHits: {} };
+    }
+    const emos = classifyEmotion(c.text);
+    buckets[key].counts[emos.primary]++;
+    buckets[key].total++;
+    for (const tp of TOPIC_PATTERNS) {
+      if (tp.pattern.test(c.text)) {
+        buckets[key].topicHits[tp.id] = (buckets[key].topicHits[tp.id] || 0) + 1;
+      }
+    }
+  }
+
+  const keys = Object.keys(buckets).sort();
+  if (keys.length < 2) {
+    return { available: false, summary: '时间区间不足，无法判断趋势。', intervalHours };
+  }
+
+  const mid = Math.floor(keys.length / 2);
+  const firstHalf = keys.slice(0, mid);
+  const secondHalf = keys.slice(mid);
+
+  const sumSlice = (slice) => {
+    const agg = { anger: 0, worry: 0, verify: 0, onlook: 0, total: 0 };
+    for (const k of slice) {
+      const b = buckets[k];
+      for (const e of Object.keys(agg)) {
+        if (e === 'total') agg.total += b.total;
+        else agg[e] += b.counts[e];
+      }
+    }
+    return agg;
+  };
+
+  const first = sumSlice(firstHalf);
+  const second = sumSlice(secondHalf);
+
+  function pct(obj, key) {
+    return obj.total > 0 ? (obj[key] / obj.total) * 100 : 0;
+  }
+
+  const risingEmotions = [];
+  const fallingEmotions = [];
+  for (const emo of ['anger', 'worry', 'verify', 'onlook']) {
+    const diff = pct(second, emo) - pct(first, emo);
+    if (diff >= 8) {
+      risingEmotions.push({ emotion: emo, diff: Math.round(diff) });
+    } else if (diff <= -8) {
+      fallingEmotions.push({ emotion: emo, diff: Math.round(diff) });
+    }
+  }
+
+  const topicRising = [];
+  for (const tp of TOPIC_PATTERNS) {
+    let firstCount = 0, secondCount = 0;
+    for (const k of firstHalf) firstCount += buckets[k].topicHits[tp.id] || 0;
+    for (const k of secondHalf) secondCount += buckets[k].topicHits[tp.id] || 0;
+    const firstTotal = first.total || 1;
+    const secondTotal = second.total || 1;
+    const firstRate = firstCount / firstTotal;
+    const secondRate = secondCount / secondTotal;
+    const diff = secondRate - firstRate;
+    if (diff >= 0.05 && secondCount >= 2) {
+      topicRising.push({ topic: tp.id, question: tp.question, diffPct: Math.round(diff * 100) });
+    }
+  }
+
+  const summaryParts = [];
+  if (risingEmotions.length > 0) {
+    const labels = risingEmotions.map(r => `${EMOTION_CATEGORIES[r.emotion].label}(+${r.diff}%)`).join('、');
+    summaryParts.push(`后半段${labels}明显上升`);
+  }
+  if (topicRising.length > 0) {
+    const topRising = topicRising.sort((a, b) => b.diffPct - a.diffPct).slice(0, 2);
+    const labels = topRising.map(r => `"${r.question}"(+${r.diffPct}%)`).join('、');
+    summaryParts.push(`质疑点${labels}升温`);
+  }
+  if (fallingEmotions.length > 0 && risingEmotions.length === 0 && topicRising.length === 0) {
+    const labels = fallingEmotions.map(r => `${EMOTION_CATEGORIES[r.emotion].label}(${r.diff}%)`).join('、');
+    summaryParts.push(`${labels}有所回落，整体情绪趋缓`);
+  }
+  if (summaryParts.length === 0) {
+    summaryParts.push('各情绪和质疑比例相对稳定，无明显升温信号');
+  }
+
+  const summary = summaryParts.join('，') + '。';
+
+  return {
+    available: true,
+    intervalHours,
+    bucketCount: keys.length,
+    summary,
+    risingEmotions,
+    fallingEmotions,
+    topicRising: topicRising.sort((a, b) => b.diffPct - a.diffPct),
+    firstHalf,
+    secondHalf
+  };
+}
+
 function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
   const paths = Array.isArray(filePaths) ? filePaths : [filePaths];
   const { comments: rawComments, fileStats } = parseFiles(paths);
@@ -497,9 +633,16 @@ function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
   }
   const emotionAnalysis = analyzeEmotions(comments);
   const topics = extractTopics(comments, supplementaryFacts);
+  const trend = analyzeTrend(comments);
   const emotionOverview = generateEmotionOverview(emotionAnalysis);
   const doubts = generateDoubts(topics, supplementaryFacts);
   const priority = generatePriority(topics, emotionAnalysis, supplementaryFacts);
+
+  const unaddressed = topics.filter(t => !t.addressed);
+  const topEmotion = Object.entries(emotionAnalysis.percentages)
+    .sort((a, b) => b[1] - a[1])[0];
+  const firstPriority = priority.find(l => l.includes('第一优先')) || priority[0];
+
   return {
     eventName,
     timeRange,
@@ -510,7 +653,198 @@ function runAnalysis(eventName, timeRange, filePaths, supplementaryFacts) {
     priority,
     emotionAnalysis,
     topics,
-    supplementaryFacts: supplementaryFacts || []
+    trend,
+    supplementaryFacts: supplementaryFacts || [],
+    summary: {
+      topEmotionLabel: EMOTION_CATEGORIES[topEmotion[0]].label,
+      topEmotionRatio: topEmotion[1],
+      firstPriority: firstPriority ? firstPriority.replace(/^[→\s]*/, '') : '',
+      unaddressedCount: unaddressed.length,
+      trendSummary: trend.summary
+    }
+  };
+}
+
+function parseBatchConfig(configPath) {
+  const resolved = path.resolve(configPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`批量配置文件不存在: ${resolved}`);
+  }
+  const content = fs.readFileSync(resolved, 'utf-8');
+  const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0 && !l.trim().startsWith('#'));
+  const events = [];
+  for (const line of lines) {
+    const parts = line.split('|').map(s => s.trim());
+    if (parts.length < 2) continue;
+    const [name, timeRange, ...fileParts] = parts;
+    const filePaths = fileParts
+      .join('|').split(/[,;]/).map(s => s.trim())
+      .filter(Boolean)
+      .map(s => {
+        if (s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1);
+        if (s.startsWith("'") && s.endsWith("'")) return s.slice(1, -1);
+        return s;
+      });
+    if (name && filePaths.length > 0) {
+      events.push({ name, timeRange, filePaths });
+    }
+  }
+  return events;
+}
+
+function runBatchAnalysis(events, outputDir) {
+  const dir = outputDir || process.cwd();
+  const results = [];
+  const errors = [];
+  for (const ev of events) {
+    try {
+      const result = runAnalysis(ev.name, ev.timeRange, ev.filePaths, []);
+      const baseInfo = exportReport(result, 'txt', dir);
+      const mdInfo = exportReport(result, 'md', dir);
+      results.push({
+        event: ev.name,
+        result,
+        files: [baseInfo, mdInfo]
+      });
+    } catch (e) {
+      errors.push({ event: ev.name, error: e.message });
+    }
+  }
+  return { results, errors, outputDir: dir };
+}
+
+function generateBatchSummary(batchResult) {
+  const { results, errors, outputDir } = batchResult;
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+  const DOUBLE = '═'.repeat(72);
+  const SINGLE = '─'.repeat(72);
+
+  lines.push(DOUBLE);
+  lines.push(`  舆情日报汇总 · ${results.length} 个事件`);
+  lines.push(`  生成时间: ${now}`);
+  lines.push(`  输出目录: ${outputDir}`);
+  lines.push(DOUBLE);
+  lines.push('');
+
+  if (results.length > 0) {
+    lines.push(SINGLE);
+    lines.push(`  ${pad('事件', 24)}${pad('评论', 8)}${pad('最高情绪', 10)}${pad('第一优先', 30)}`);
+    lines.push(SINGLE);
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const s = r.result.summary;
+      lines.push(`  ${pad(r.event, 24)}${pad(String(r.result.commentCount), 8)}${pad(`${s.topEmotionLabel}${s.topEmotionRatio}%`, 10)}${pad(s.firstPriority, 30)}`);
+    }
+    lines.push('');
+
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const s = r.result.summary;
+      lines.push(`${i + 1}. ${r.event}`);
+      lines.push(`   评论: ${r.result.commentCount} 条`);
+      lines.push(`   最高情绪: ${s.topEmotionLabel} (${s.topEmotionRatio}%)`);
+      lines.push(`   第一优先: ${s.firstPriority}`);
+      lines.push(`   趋势: ${s.trendSummary}`);
+      lines.push(`   文件: ${r.files.map(f => f.filename).join(' / ')}`);
+      lines.push('');
+    }
+  }
+
+  if (errors.length > 0) {
+    lines.push(SINGLE);
+    lines.push(`  以下事件分析失败 (${errors.length} 个):`);
+    lines.push(SINGLE);
+    for (const e of errors) {
+      lines.push(`  ✗ ${e.event}: ${e.error}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(DOUBLE);
+  lines.push(`  *由 CrisisPulse v1.2 于 ${now} 批量生成*`);
+  lines.push(DOUBLE);
+
+  return lines.join('\n');
+
+  function pad(str, len) {
+    const s = String(str || '');
+    if (s.length >= len) return s.slice(0, len - 1) + '…';
+    return s + ' '.repeat(len - s.length);
+  }
+}
+
+function generateBatchMarkdown(batchResult) {
+  const { results, errors, outputDir } = batchResult;
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+
+  lines.push(`# 舆情日报汇总`);
+  lines.push('');
+  lines.push(`> 生成时间: ${now}`);
+  lines.push(`> 事件数量: ${results.length} 个`);
+  lines.push(`> 输出目录: ${outputDir}`);
+  lines.push('');
+
+  if (results.length > 0) {
+    lines.push('## 事件一览');
+    lines.push('');
+    lines.push('| # | 事件 | 评论数 | 最高情绪 | 第一优先 | 趋势 |');
+    lines.push('|---|------|--------|----------|----------|------|');
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const s = r.result.summary;
+      lines.push(`| ${i + 1} | ${r.event} | ${r.result.commentCount} | ${s.topEmotionLabel} ${s.topEmotionRatio}% | ${s.firstPriority} | ${s.trendSummary} |`);
+    }
+    lines.push('');
+
+    lines.push('## 详细清单');
+    lines.push('');
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const s = r.result.summary;
+      lines.push(`### ${i + 1}. ${r.event}`);
+      lines.push('');
+      lines.push(`- 评论数: **${r.result.commentCount}**`);
+      lines.push(`- 最高情绪: **${s.topEmotionLabel}** (${s.topEmotionRatio}%)`);
+      lines.push(`- 第一优先: ${s.firstPriority}`);
+      lines.push(`- 趋势: ${s.trendSummary}`);
+      lines.push(`- 报告文件: ${r.files.map(f => `[\`${f.filename}\`](${f.filename})`).join(' / ')}`);
+      lines.push('');
+    }
+  }
+
+  if (errors.length > 0) {
+    lines.push('## 分析失败');
+    lines.push('');
+    for (const e of errors) {
+      lines.push(`- ❌ ${e.event}: ${e.error}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push(`*由 CrisisPulse v1.2 于 ${now} 批量生成*`);
+
+  return lines.join('\n');
+}
+
+function exportBatchReport(batchResult, outputDir) {
+  const dir = outputDir || batchResult.outputDir || process.cwd();
+  const ts = timestampForFile();
+  const baseName = `舆情汇总_${ts}`;
+  const txtPath = path.join(dir, `${baseName}.txt`);
+  const mdPath = path.join(dir, `${baseName}.md`);
+
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(txtPath, generateBatchSummary(batchResult), 'utf-8');
+  fs.writeFileSync(mdPath, generateBatchMarkdown(batchResult), 'utf-8');
+
+  return {
+    txt: { path: txtPath, filename: path.basename(txtPath) },
+    md: { path: mdPath, filename: path.basename(mdPath) }
   };
 }
 
@@ -524,10 +858,16 @@ module.exports = {
   normalizeDateStart,
   normalizeDateEnd,
   parseCommentTime,
+  analyzeTrend,
   generateEmotionOverview,
   generateDoubts,
   generatePriority,
   runAnalysis,
+  parseBatchConfig,
+  runBatchAnalysis,
+  generateBatchSummary,
+  generateBatchMarkdown,
+  exportBatchReport,
   EMOTION_CATEGORIES,
   TOPIC_PATTERNS
 };

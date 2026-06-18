@@ -1,0 +1,7 @@
+# 批量配置文件格式：事件名称|时间范围|文件1,文件2
+# 井号开头为注释
+# 时间范围可留空
+# 文件支持多个，用逗号或分号分隔
+
+化工厂爆炸事故|2025-06-18~2025-06-19|samples/crisis_comments.txt,samples/weibo_comments.txt
+地铁延误事件||samples/weibo_comments.txt

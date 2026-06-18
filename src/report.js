@@ -30,8 +30,36 @@ function buildFileStatsLine(fileStats, indent) {
   return lines.join('\n');
 }
 
-function formatReport(result) {
+function buildTrendSection(result) {
+  if (!result.trend) return '';
+  const lines = [];
+  lines.push(DIVIDER);
+  lines.push('  四、趋势判断');
+  lines.push(DIVIDER);
+  lines.push(`  ${result.trend.summary}`);
+  if (result.trend.risingEmotions && result.trend.risingEmotions.length > 0) {
+    const rising = result.trend.risingEmotions.map(r => `${r.emotion} +${r.diff}%`).join(', ');
+    lines.push(`  升温情绪: ${rising}`);
+  }
+  if (result.trend.topicRising && result.trend.topicRising.length > 0) {
+    const topics = result.trend.topicRising.slice(0, 3).map(r => `"${r.question}" +${r.diffPct}%`).join(', ');
+    lines.push(`  升温质疑: ${topics}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+function formatReport(result, mode) {
+  const fmtMode = mode || 'full';
   const now = new Date().toLocaleString('zh-CN', { hour12: false });
+
+  if (fmtMode === 'brief') {
+    return formatBrief(result);
+  }
+  if (fmtMode === 'priority') {
+    return formatPriorityOnly(result);
+  }
+
   const lines = [];
 
   lines.push(DOUBLE_DIVIDER);
@@ -70,6 +98,9 @@ function formatReport(result) {
   }
   lines.push('');
 
+  const trendSection = buildTrendSection(result);
+  if (trendSection) lines.push(trendSection);
+
   if (result.supplementaryFacts && result.supplementaryFacts.length > 0) {
     lines.push(DIVIDER);
     lines.push('  附：已录入补充事实');
@@ -81,7 +112,72 @@ function formatReport(result) {
   }
 
   lines.push(DOUBLE_DIVIDER);
-  lines.push('  提示: 输入补充事实可重新生成建议；输入 /save txt 或 /save md 可导出报告；直接回车退出');
+  lines.push('  命令: /facts 查看事实  /undo 撤回  /replace N 新内容  /save 导出  /quit 退出  /help 帮助');
+  lines.push(DOUBLE_DIVIDER);
+
+  return lines.join('\n');
+}
+
+function formatBrief(result) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+  const ea = result.emotionAnalysis;
+
+  lines.push(DOUBLE_DIVIDER);
+  lines.push(`  舆情快报 · ${result.eventName || '未命名事件'}`);
+  lines.push(`  ${now} | 评论 ${result.commentCount} 条`);
+  lines.push(DOUBLE_DIVIDER);
+  lines.push('');
+  lines.push(`  情绪: [愤怒${ea.percentages.anger}%] [担忧${ea.percentages.worry}%] [求证${ea.percentages.verify}%] [围观${ea.percentages.onlook}%]`);
+  lines.push(`  ${result.emotionOverview}`);
+  lines.push('');
+  lines.push('  🔴 主要质疑:');
+  const unaddressed = result.doubts.filter(d => !d.includes('[已回应]')).slice(0, 3);
+  for (let i = 0; i < unaddressed.length; i++) {
+    const clean = unaddressed[i]
+      .replace(/^\s*\d+\.\s*/, '')
+      .replace(/\n\s+/g, ' / ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    lines.push(`    ${i + 1}. ${clean}`);
+  }
+  lines.push('');
+  lines.push('  🎯 回应优先级:');
+  const priorities = result.priority.filter(p => p.startsWith('→')).slice(0, 3);
+  for (let i = 0; i < priorities.length; i++) {
+    lines.push(`    ${priorities[i]}`);
+  }
+  if (result.trend && result.trend.summary) {
+    lines.push('');
+    lines.push(`  📈 趋势: ${result.trend.summary}`);
+  }
+  lines.push('');
+  lines.push(DOUBLE_DIVIDER);
+  return lines.join('\n');
+}
+
+function formatPriorityOnly(result) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+
+  lines.push(DOUBLE_DIVIDER);
+  lines.push(`  回应建议 · ${result.eventName || '未命名事件'}`);
+  lines.push(`  ${now} | 评论 ${result.commentCount} 条`);
+  lines.push(DOUBLE_DIVIDER);
+  lines.push('');
+
+  for (const p of result.priority) {
+    lines.push(`  ${p}`);
+  }
+  lines.push('');
+
+  if (result.trend && result.trend.summary) {
+    lines.push(`  📈 趋势提示: ${result.trend.summary}`);
+    lines.push('');
+  }
+
+  lines.push(DOUBLE_DIVIDER);
+  lines.push(`  *由 CrisisPulse 于 ${now} 生成*`);
   lines.push(DOUBLE_DIVIDER);
 
   return lines.join('\n');
@@ -119,12 +215,23 @@ function formatBriefUpdate(result) {
     lines.push(`  ${p}`);
   }
   lines.push('');
+  const trendSection = buildTrendSection(result);
+  if (trendSection) lines.push(trendSection);
   lines.push(DOUBLE_DIVIDER);
   return lines.join('\n');
 }
 
-function formatMarkdown(result) {
+function formatMarkdown(result, mode) {
+  const fmtMode = mode || 'full';
   const now = new Date().toLocaleString('zh-CN', { hour12: false });
+
+  if (fmtMode === 'brief') {
+    return formatMarkdownBrief(result);
+  }
+  if (fmtMode === 'priority') {
+    return formatMarkdownPriority(result);
+  }
+
   const lines = [];
 
   lines.push(`# 舆情快报 · ${result.eventName || '未命名事件'}`);
@@ -175,6 +282,27 @@ function formatMarkdown(result) {
   }
   lines.push('');
 
+  if (result.trend && result.trend.summary) {
+    lines.push('## 四、趋势判断');
+    lines.push('');
+    lines.push(result.trend.summary);
+    lines.push('');
+    if (result.trend.risingEmotions && result.trend.risingEmotions.length > 0) {
+      lines.push('**升温情绪:**');
+      for (const r of result.trend.risingEmotions) {
+        lines.push(`- ${r.emotion}: +${r.diff}%`);
+      }
+      lines.push('');
+    }
+    if (result.trend.topicRising && result.trend.topicRising.length > 0) {
+      lines.push('**升温质疑:**');
+      for (const r of result.trend.topicRising.slice(0, 5)) {
+        lines.push(`- ${r.question}: +${r.diffPct}%`);
+      }
+      lines.push('');
+    }
+  }
+
   if (result.supplementaryFacts && result.supplementaryFacts.length > 0) {
     lines.push('## 附：已录入补充事实');
     lines.push('');
@@ -190,35 +318,110 @@ function formatMarkdown(result) {
   return lines.join('\n');
 }
 
-function exportReport(result, format, outputDir) {
+function formatMarkdownBrief(result) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const ea = result.emotionAnalysis;
+  const lines = [];
+  lines.push(`# 舆情快报 · ${result.eventName || '未命名事件'}`);
+  lines.push('');
+  lines.push(`> ${now} · 评论 ${result.commentCount} 条`);
+  lines.push('');
+  lines.push('## 情绪概览');
+  lines.push(`| 愤怒 | 担忧 | 求证 | 围观 |`);
+  lines.push(`| ---- | ---- | ---- | ---- |`);
+  lines.push(`| ${ea.percentages.anger}% | ${ea.percentages.worry}% | ${ea.percentages.verify}% | ${ea.percentages.onlook}% |`);
+  lines.push('');
+  lines.push(result.emotionOverview);
+  lines.push('');
+  lines.push('## 主要质疑');
+  lines.push('');
+  const unaddressed = result.doubts.filter(d => !d.includes('[已回应]')).slice(0, 3);
+  for (let i = 0; i < unaddressed.length; i++) {
+    const clean = unaddressed[i]
+      .replace(/^\s*\d+\.\s*/, '')
+      .replace(/\n\s+/g, ' / ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    lines.push(`${i + 1}. ${clean}`);
+  }
+  lines.push('');
+  lines.push('## 回应优先级');
+  lines.push('');
+  const priorities = result.priority.filter(p => p.startsWith('→')).slice(0, 3);
+  for (const p of priorities) {
+    lines.push(`- ${p}`);
+  }
+  if (result.trend && result.trend.summary) {
+    lines.push('');
+    lines.push('## 趋势');
+    lines.push(result.trend.summary);
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push(`*由 CrisisPulse 于 ${now} 生成*`);
+  return lines.join('\n');
+}
+
+function formatMarkdownPriority(result) {
+  const now = new Date().toLocaleString('zh-CN', { hour12: false });
+  const lines = [];
+  lines.push(`# 回应建议 · ${result.eventName || '未命名事件'}`);
+  lines.push('');
+  lines.push(`> ${now} · 评论 ${result.commentCount} 条`);
+  lines.push('');
+  for (const p of result.priority) {
+    lines.push(`- ${p}`);
+  }
+  if (result.trend && result.trend.summary) {
+    lines.push('');
+    lines.push(`**趋势提示**: ${result.trend.summary}`);
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push(`*由 CrisisPulse 于 ${now} 生成*`);
+  return lines.join('\n');
+}
+
+function exportReport(result, format, outputDir, mode) {
   const fmt = (format || 'txt').toLowerCase();
+  const exportMode = mode || 'full';
   const dir = outputDir || process.cwd();
   const now = new Date();
   const ts = timestampForFile(now);
   const safeName = sanitizeFilename(result.eventName || 'crisis_report');
   const ext = fmt === 'md' || fmt === 'markdown' ? 'md' : 'txt';
-  const filename = `舆情_${safeName}_${ts}.${ext}`;
+
+  let modeSuffix = '';
+  if (exportMode === 'brief') modeSuffix = '_简版';
+  if (exportMode === 'priority') modeSuffix = '_建议';
+
+  const filename = `舆情_${safeName}${modeSuffix}_${ts}.${ext}`;
   const fullPath = path.join(dir, filename);
 
   let content;
   if (ext === 'md') {
-    content = formatMarkdown(result);
+    content = formatMarkdown(result, exportMode);
   } else {
-    content = formatReport(result);
+    content = formatReport(result, exportMode);
   }
 
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(fullPath, content, 'utf-8');
-  return { path: fullPath, filename, format: ext, size: content.length };
+  return { path: fullPath, filename, format: ext, mode: exportMode, size: content.length };
 }
 
 module.exports = {
   formatReport,
+  formatBrief,
+  formatPriorityOnly,
   formatBriefUpdate,
   formatMarkdown,
+  formatMarkdownBrief,
+  formatMarkdownPriority,
   exportReport,
   timestampForFile,
-  sanitizeFilename
+  sanitizeFilename,
+  buildFileStatsLine
 };
